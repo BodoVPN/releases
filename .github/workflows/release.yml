@@ -34,6 +34,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out the private source at the tag (for its version)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          sparse-checkout: pubspec.yaml
+          sparse-checkout-cone-mode: false
+
       - name: Create (or reuse) the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -44,20 +53,47 @@ jobs:
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "BodoVPN $TAG" --notes "$(cat <<'EOF'
           نسخه جدید بدو وی‌پی‌ان. فایل مناسب دستگاه خود را از بخش Assets دانلود کنید:
 
-          - **Windows** — فایل `-windows-x64.zip` را باز کنید و `bodovpn_client.exe` را اجرا کنید (اجازه مدیر برای ساخت اتصال VPN لازم است).
-          - **Linux** — فایل `-linux-x64.tar.gz` را باز کنید و `bodovpn_client` را اجرا کنید (هنگام اتصال، رمز کاربر برای ساخت اتصال VPN پرسیده می‌شود).
+          - **Windows** — نصب‌کننده `-windows-x64-setup.exe` را اجرا کنید (فایل `.zip` هم برای نصب دستی هست). اپلیکیشن برای ساخت اتصال VPN اجازه مدیر می‌خواهد.
+          - **Linux** — بسته `-linux-x64.deb` را نصب کنید (`sudo apt install ./bodovpn-…deb`)؛ فایل `.tar.gz` هم برای اجرای مستقیم هست.
           - **Android** — فایل `.apk` را نصب کنید؛ نسخه گوگل پلی به‌زودی.
 
           --------
 
           New BodoVPN release. Pick the file for your device under Assets:
 
-          - **Windows** — unzip `-windows-x64.zip` and run `bodovpn_client.exe` (asks for administrator rights to create the VPN adapter).
-          - **Linux** — extract `-linux-x64.tar.gz` and run `bodovpn_client` (asks for your password when connecting, to create the VPN device).
+          - **Windows** — run the `-windows-x64-setup.exe` installer (the `.zip` is there for a manual install). The app asks for administrator rights to create the VPN adapter.
+          - **Linux** — install the `-linux-x64.deb` (`sudo apt install ./bodovpn-…deb`); the `.tar.gz` runs in place.
           - **Android** — install the `.apk`; the Google Play listing is coming.
           EOF
           )"
           fi
+
+      # latest.json is what the backend's /api/client/app/latest reads: the version this
+      # release carries and the per-platform download to send each app to.
+      - name: Publish the update manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(grep -E '^version:' pubspec.yaml | sed -E 's/^version:[[:space:]]*//')
+          NAME=${VERSION%%+*}
+          CODE=${VERSION##*+}
+          BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          cat > latest.json <<EOF
+          {
+            "tag": "$TAG",
+            "versionName": "$NAME",
+            "versionCode": $CODE,
+            "downloads": {
+              "windows": "$BASE/bodovpn-$TAG-windows-x64-setup.exe",
+              "windowsZip": "$BASE/bodovpn-$TAG-windows-x64.zip",
+              "linux": "$BASE/bodovpn-$TAG-linux-x64.deb",
+              "linuxTar": "$BASE/bodovpn-$TAG-linux-x64.tar.gz",
+              "android": "$BASE/bodovpn-$TAG.apk"
+            }
+          }
+          EOF
+          cat latest.json
+          gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber
 
   android:
     needs: create-release
@@ -181,13 +217,22 @@ jobs:
             if (-not (Test-Path "$rel/$f")) { Write-Error "missing $f in the Windows bundle"; exit 1 }
           }
 
+      - name: Build the installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $ver = ($env:TAG).TrimStart('v')
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y | Out-Null }
+          & $iscc "/DAppVersion=$ver" "/DSourceDir=$PWD\build\windows\x64\runner\Release" "/DOutputDir=$PWD\dist" windows\installer\bodovpn.iss | Select-Object -Last 3
+          Get-ChildItem dist
+
       - name: Attach to the release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath "bodovpn-$env:TAG-windows-x64.zip"
-          gh release upload "$env:TAG" "bodovpn-$env:TAG-windows-x64.zip" --repo "$env:GITHUB_REPOSITORY" --clobber
+          gh release upload "$env:TAG" "bodovpn-$env:TAG-windows-x64.zip" "dist/bodovpn-$(($env:TAG).TrimStart('v'))-windows-x64-setup.exe#bodovpn-$env:TAG-windows-x64-setup.exe" --repo "$env:GITHUB_REPOSITORY" --clobber
 
   linux:
     needs: create-release
@@ -206,7 +251,7 @@ jobs:
       - name: Linux desktop toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libstdc++-12-dev unzip
+          sudo apt-get install -y -qq clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libstdc++-12-dev libsecret-1-dev unzip
 
       - name: Resolve Flutter version from .fvmrc
         id: fvm
@@ -233,9 +278,15 @@ jobs:
           done
           [ -x "$B/lib/xray/bodovpn-tun-helper" ] || { echo "::error::helper is not executable"; exit 1; }
 
+      - name: Build the .deb
+        run: |
+          VER=${TAG#v}
+          bash linux/packaging/build-deb.sh "$VER" build/linux/x64/release/bundle dist
+          dpkg-deb --info "dist/bodovpn-v$VER-linux-x64.deb" | head -12
+
       - name: Attach to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tar -C build/linux/x64/release -czf "bodovpn-$TAG-linux-x64.tar.gz" --transform "s,^bundle,bodovpn," bundle
-          gh release upload "$TAG" "bodovpn-$TAG-linux-x64.tar.gz" --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload "$TAG" "bodovpn-$TAG-linux-x64.tar.gz" "dist/bodovpn-$TAG-linux-x64.deb" --repo "$GITHUB_REPOSITORY" --clobber
