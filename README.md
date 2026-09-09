@@ -7,6 +7,7 @@
 | دستگاه | فایل | نصب |
 | --- | --- | --- |
 | ویندوز (۶۴ بیت) | `bodovpn-vX.Y.Z-windows-x64.zip` | فایل را باز کنید و `bodovpn_client.exe` را اجرا کنید. اپلیکیشن برای ساخت اتصال VPN اجازه مدیر می‌خواهد. |
+| لینوکس (۶۴ بیت) | `bodovpn-vX.Y.Z-linux-x64.tar.gz` | فایل را باز کنید و `bodovpn_client` را اجرا کنید. هنگام اتصال، رمز کاربر برای ساخت اتصال VPN پرسیده می‌شود. |
 | اندروید | `bodovpn-vX.Y.Z.apk` | فایل را نصب کنید. نسخه گوگل پلی به‌زودی منتشر می‌شود. |
 
 ورود با حساب تلگرام از داخل اپلیکیشن انجام می‌شود؛ خرید اشتراک در [bodovpn.com](https://bodovpn.com).
@@ -22,6 +23,7 @@ Official BodoVPN app releases are published here. Get the latest from the [Relea
 | Device | File | Install |
 | --- | --- | --- |
 | Windows (64-bit) | `bodovpn-vX.Y.Z-windows-x64.zip` | Unzip and run `bodovpn_client.exe`. It asks for administrator rights to create the VPN adapter. |
+| Linux (64-bit) | `bodovpn-vX.Y.Z-linux-x64.tar.gz` | Extract and run `bodovpn_client`. Asks for your password when connecting, to create the VPN device. |
 | Android | `bodovpn-vX.Y.Z.apk` | Install the APK. The Google Play listing is coming. |
 
 Sign in with your Telegram account inside the app; subscriptions are sold at [bodovpn.com](https://bodovpn.com).

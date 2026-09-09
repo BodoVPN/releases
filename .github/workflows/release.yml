@@ -45,6 +45,7 @@ jobs:
           نسخه جدید بدو وی‌پی‌ان. فایل مناسب دستگاه خود را از بخش Assets دانلود کنید:
 
           - **Windows** — فایل `-windows-x64.zip` را باز کنید و `bodovpn_client.exe` را اجرا کنید (اجازه مدیر برای ساخت اتصال VPN لازم است).
+          - **Linux** — فایل `-linux-x64.tar.gz` را باز کنید و `bodovpn_client` را اجرا کنید (هنگام اتصال، رمز کاربر برای ساخت اتصال VPN پرسیده می‌شود).
           - **Android** — فایل `.apk` را نصب کنید؛ نسخه گوگل پلی به‌زودی.
 
           --------
@@ -52,6 +53,7 @@ jobs:
           New BodoVPN release. Pick the file for your device under Assets:
 
           - **Windows** — unzip `-windows-x64.zip` and run `bodovpn_client.exe` (asks for administrator rights to create the VPN adapter).
+          - **Linux** — extract `-linux-x64.tar.gz` and run `bodovpn_client` (asks for your password when connecting, to create the VPN device).
           - **Android** — install the `.apk`; the Google Play listing is coming.
           EOF
           )"
@@ -186,3 +188,54 @@ jobs:
         run: |
           Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath "bodovpn-$env:TAG-windows-x64.zip"
           gh release upload "$env:TAG" "bodovpn-$env:TAG-windows-x64.zip" --repo "$env:GITHUB_REPOSITORY" --clobber
+
+  linux:
+    needs: create-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the private source at the tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      - name: Linux desktop toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libstdc++-12-dev unzip
+
+      - name: Resolve Flutter version from .fvmrc
+        id: fvm
+        run: echo "version=$(jq -r .flutter .fvmrc)" >> "$GITHUB_OUTPUT"
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ steps.fvm.outputs.version }}
+          cache: true
+
+      - run: flutter pub get
+
+      - name: Fetch the pinned engine binaries (Xray, tun2socks)
+        run: bash tool/fetch_linux_engine.sh
+
+      - name: Build Linux release (prod flavor)
+        run: flutter build linux --release --dart-define=FLAVOR=prod
+
+      - name: Assert the bundle is complete
+        run: |
+          B=build/linux/x64/release/bundle
+          for f in bodovpn_client lib/xray/xray lib/xray/tun2socks lib/xray/bodovpn-tun-helper lib/xray/geoip.dat lib/xray/geosite.dat; do
+            [ -e "$B/$f" ] || { echo "::error::missing $f in the Linux bundle"; exit 1; }
+          done
+          [ -x "$B/lib/xray/bodovpn-tun-helper" ] || { echo "::error::helper is not executable"; exit 1; }
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tar -C build/linux/x64/release -czf "bodovpn-$TAG-linux-x64.tar.gz" --transform "s,^bundle,bodovpn," bundle
+          gh release upload "$TAG" "bodovpn-$TAG-linux-x64.tar.gz" --repo "$GITHUB_REPOSITORY" --clobber
