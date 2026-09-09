@@ -1,0 +1,188 @@
+name: Build & publish a release
+
+# This public repo holds ONLY the published apps. The source lives in the private
+# BodoVPN/bodovpn-client repo; a tag pushed there dispatches a build here (public-repo
+# Actions minutes are free), the source is checked out with a read-only token and never
+# committed here, and the artifacts are attached to a release on this repo.
+#
+# Trigger: `repository_dispatch` (event_type: release, client_payload.tag: vX.Y.Z) from the
+# private repo's CI, or run it by hand with the tag.
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag in BodoVPN/bodovpn-client to build (vX.Y.Z)"
+        required: true
+
+concurrency:
+  group: release-${{ github.event.client_payload.tag || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: BodoVPN/bodovpn-client
+  TAG: ${{ github.event.client_payload.tag || inputs.tag }}
+
+jobs:
+  # The release is created once, empty, so the two builders can attach in parallel
+  # without racing to create it.
+  create-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Create (or reuse) the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG exists"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "BodoVPN $TAG" --notes "$(cat <<'EOF'
+          نسخه جدید بدو وی‌پی‌ان. فایل مناسب دستگاه خود را از بخش Assets دانلود کنید:
+
+          - **Windows** — فایل `-windows-x64.zip` را باز کنید و `bodovpn_client.exe` را اجرا کنید (اجازه مدیر برای ساخت اتصال VPN لازم است).
+          - **Android** — فایل `.apk` را نصب کنید؛ نسخه گوگل پلی به‌زودی.
+
+          --------
+
+          New BodoVPN release. Pick the file for your device under Assets:
+
+          - **Windows** — unzip `-windows-x64.zip` and run `bodovpn_client.exe` (asks for administrator rights to create the VPN adapter).
+          - **Android** — install the `.apk`; the Google Play listing is coming.
+          EOF
+          )"
+          fi
+
+  android:
+    needs: create-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the private source at the tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Resolve Flutter version from .fvmrc
+        id: fvm
+        run: echo "version=$(jq -r .flutter .fvmrc)" >> "$GITHUB_OUTPUT"
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ steps.fvm.outputs.version }}
+          cache: true
+
+      - run: flutter pub get
+
+      - name: Reconstruct release signing config from secrets
+        env:
+          KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::RELEASE_KEYSTORE_BASE64 is not set on this repo."
+            exit 1
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > android/app/release.keystore
+          {
+            echo "storeFile=release.keystore"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > android/key.properties
+
+      - name: Build release APK (prod flavor)
+        run: flutter build apk --release --dart-define=FLAVOR=prod
+
+      - name: Build release AAB (prod flavor, Play signing host)
+        run: flutter build appbundle --release --dart-define=FLAVOR=prod --dart-define=TELEGRAM_LOGIN_HOST=app3921234693-login.tg.dev
+
+      - name: Assert the artifacts are release-signed
+        run: |
+          APKSIGNER=$(find "${ANDROID_SDK_ROOT:-$ANDROID_HOME}" -name apksigner -type f 2>/dev/null | sort | tail -1)
+          if [ -n "$APKSIGNER" ]; then
+            CERTS=$("$APKSIGNER" verify --print-certs build/app/outputs/flutter-apk/app-release.apk)
+            if echo "$CERTS" | grep -q "CN=Android Debug"; then echo "::error::APK is debug-signed"; exit 1; fi
+          fi
+          AAB_CERTS=$(keytool -printcert -jarfile build/app/outputs/bundle/release/app-release.aab)
+          if ! echo "$AAB_CERTS" | grep -q "Owner:"; then echo "::error::AAB is unsigned"; exit 1; fi
+          if echo "$AAB_CERTS" | grep -q "CN=Android Debug"; then echo "::error::AAB is debug-signed"; exit 1; fi
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp build/app/outputs/flutter-apk/app-release.apk "bodovpn-$TAG.apk"
+          cp build/app/outputs/bundle/release/app-release.aab "bodovpn-$TAG.aab"
+          gh release upload "$TAG" "bodovpn-$TAG.apk" "bodovpn-$TAG.aab" --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Scrub signing material
+        if: always()
+        run: rm -f android/app/release.keystore android/key.properties
+
+  windows:
+    needs: create-release
+    runs-on: windows-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the private source at the tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      - name: Resolve Flutter version from .fvmrc
+        id: fvm
+        shell: bash
+        run: echo "version=$(jq -r .flutter .fvmrc)" >> "$GITHUB_OUTPUT"
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ steps.fvm.outputs.version }}
+          cache: true
+
+      - run: flutter pub get
+
+      - name: Fetch the pinned engine binaries (Xray, tun2socks, wintun)
+        shell: pwsh
+        run: pwsh tool/fetch_windows_engine.ps1
+
+      - name: Build Windows release (prod flavor)
+        shell: pwsh
+        run: flutter build windows --release --dart-define=FLAVOR=prod
+
+      - name: Assert the bundle is complete
+        shell: pwsh
+        run: |
+          $rel = "build/windows/x64/runner/Release"
+          foreach ($f in "bodovpn_client.exe", "bodovpn_link.exe", "xray/xray.exe", "xray/tun2socks.exe", "xray/wintun.dll", "xray/geoip.dat", "xray/geosite.dat") {
+            if (-not (Test-Path "$rel/$f")) { Write-Error "missing $f in the Windows bundle"; exit 1 }
+          }
+
+      - name: Attach to the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath "bodovpn-$env:TAG-windows-x64.zip"
+          gh release upload "$env:TAG" "bodovpn-$env:TAG-windows-x64.zip" --repo "$env:GITHUB_REPOSITORY" --clobber
