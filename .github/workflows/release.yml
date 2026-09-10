@@ -247,6 +247,17 @@ jobs:
           ref: ${{ env.TAG }}
           token: ${{ secrets.SOURCE_TOKEN }}
 
+      # The macOS plugins (connectivity_plus 7.3+) use macOS 26 API, so the build needs
+      # the macOS 26 SDK — the runner's default Xcode is older. Pick the newest Xcode 26.
+      - name: Select Xcode 26
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$XCODE" ]; then
+            echo "::error::No Xcode 26 on this runner image. Installed:"; ls -d /Applications/Xcode*.app; exit 1
+          fi
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+
       - name: Resolve Flutter version from .fvmrc
         id: fvm
         run: echo "version=$(jq -r .flutter .fvmrc)" >> "$GITHUB_OUTPUT"
