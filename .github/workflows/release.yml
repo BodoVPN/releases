@@ -55,6 +55,7 @@ jobs:
 
           - **Windows** — نصب‌کننده `-windows-x64-setup.exe` را اجرا کنید (فایل `.zip` هم برای نصب دستی هست). اپلیکیشن برای ساخت اتصال VPN اجازه مدیر می‌خواهد.
           - **Linux** — بسته `-linux-x64.deb` را نصب کنید (`sudo apt install ./bodovpn-…deb`)؛ فایل `.tar.gz` هم برای اجرای مستقیم هست.
+          - **macOS** — فایل `-macos.dmg` را باز کنید و اپلیکیشن را به Applications بکشید.
           - **Android** — فایل `.apk` را نصب کنید؛ نسخه گوگل پلی به‌زودی.
 
           --------
@@ -63,6 +64,7 @@ jobs:
 
           - **Windows** — run the `-windows-x64-setup.exe` installer (the `.zip` is there for a manual install). The app asks for administrator rights to create the VPN adapter.
           - **Linux** — install the `-linux-x64.deb` (`sudo apt install ./bodovpn-…deb`); the `.tar.gz` runs in place.
+          - **macOS** — open the `-macos.dmg` and drag the app to Applications.
           - **Android** — install the `.apk`; the Google Play listing is coming.
           EOF
           )"
@@ -88,6 +90,7 @@ jobs:
               "windowsZip": "$BASE/bodovpn-$TAG-windows-x64.zip",
               "linux": "$BASE/bodovpn-$TAG-linux-x64.deb",
               "linuxTar": "$BASE/bodovpn-$TAG-linux-x64.tar.gz",
+              "macos": "$BASE/bodovpn-$TAG-macos.dmg",
               "android": "$BASE/bodovpn-$TAG.apk"
             }
           }
