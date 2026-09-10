@@ -232,7 +232,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath "bodovpn-$env:TAG-windows-x64.zip"
-          gh release upload "$env:TAG" "bodovpn-$env:TAG-windows-x64.zip" "dist/bodovpn-$(($env:TAG).TrimStart('v'))-windows-x64-setup.exe#bodovpn-$env:TAG-windows-x64-setup.exe" --repo "$env:GITHUB_REPOSITORY" --clobber
+          gh release upload "$env:TAG" "bodovpn-$env:TAG-windows-x64.zip" "dist/bodovpn-$env:TAG-windows-x64-setup.exe" --repo "$env:GITHUB_REPOSITORY" --clobber
 
   linux:
     needs: create-release
