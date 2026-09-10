@@ -51,21 +51,21 @@ jobs:
             echo "release $TAG exists"
           else
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "BodoVPN $TAG" --notes "$(cat <<'EOF'
-          نسخه جدید بدو وی‌پی‌ان. فایل مناسب دستگاه خود را از بخش Assets دانلود کنید:
-
-          - **Windows** — نصب‌کننده `-windows-x64-setup.exe` را اجرا کنید (فایل `.zip` هم برای نصب دستی هست). اپلیکیشن برای ساخت اتصال VPN اجازه مدیر می‌خواهد.
-          - **Linux** — بسته `-linux-x64.deb` را نصب کنید (`sudo apt install ./bodovpn-…deb`)؛ فایل `.tar.gz` هم برای اجرای مستقیم هست.
-          - **macOS** — فایل `-macos.dmg` را باز کنید و اپلیکیشن را به Applications بکشید.
-          - **Android** — فایل `.apk` را نصب کنید؛ نسخه گوگل پلی به‌زودی.
-
-          --------
-
           New BodoVPN release. Pick the file for your device under Assets:
 
           - **Windows** — run the `-windows-x64-setup.exe` installer (the `.zip` is there for a manual install). The app asks for administrator rights to create the VPN adapter.
           - **Linux** — install the `-linux-x64.deb` (`sudo apt install ./bodovpn-…deb`); the `.tar.gz` runs in place.
           - **macOS** — open the `-macos.dmg` and drag the app to Applications.
           - **Android** — install the `.apk`; the Google Play listing is coming.
+
+          --------
+
+          نسخه جدید بدو وی‌پی‌ان. فایل مناسب دستگاه خود را از بخش Assets دانلود کنید:
+
+          - **Windows** — نصب‌کننده `-windows-x64-setup.exe` را اجرا کنید (فایل `.zip` هم برای نصب دستی هست). اپلیکیشن برای ساخت اتصال VPN اجازه مدیر می‌خواهد.
+          - **Linux** — بسته `-linux-x64.deb` را نصب کنید (`sudo apt install ./bodovpn-…deb`)؛ فایل `.tar.gz` هم برای اجرای مستقیم هست.
+          - **macOS** — فایل `-macos.dmg` را باز کنید و اپلیکیشن را به Applications بکشید.
+          - **Android** — فایل `.apk` را نصب کنید؛ نسخه گوگل پلی به‌زودی.
           EOF
           )"
           fi
