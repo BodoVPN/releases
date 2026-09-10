@@ -9,6 +9,7 @@
 | ویندوز (۶۴ بیت) | `bodovpn-vX.Y.Z-windows-x64-setup.exe` | نصب‌کننده را اجرا کنید (فایل `.zip` هم برای نصب دستی هست). اپلیکیشن برای ساخت اتصال VPN اجازه مدیر می‌خواهد. |
 | لینوکس (۶۴ بیت) | `bodovpn-vX.Y.Z-linux-x64.deb` | `sudo apt install ./bodovpn-vX.Y.Z-linux-x64.deb` (فایل `.tar.gz` هم برای اجرای مستقیم هست). هنگام اتصال، رمز کاربر برای ساخت اتصال VPN پرسیده می‌شود. |
 | اندروید | `bodovpn-vX.Y.Z.apk` | فایل را نصب کنید. نسخه گوگل پلی به‌زودی منتشر می‌شود. |
+| مک (Apple Silicon و Intel) | `bodovpn-vX.Y.Z-macos.dmg` | فایل را باز کنید و BodoVPN را به Applications بکشید. بار اول، macOS می‌پرسد افزونه شبکه «BodoVPN Tunnel» فعال شود. |
 
 ورود با حساب تلگرام از داخل اپلیکیشن انجام می‌شود؛ خرید اشتراک در [bodovpn.com](https://bodovpn.com).
 
@@ -25,5 +26,6 @@ Official BodoVPN app releases are published here. Get the latest from the [Relea
 | Windows (64-bit) | `bodovpn-vX.Y.Z-windows-x64-setup.exe` | Run the installer (the `.zip` is there for a manual install). The app asks for administrator rights to create the VPN adapter. |
 | Linux (64-bit) | `bodovpn-vX.Y.Z-linux-x64.deb` | `sudo apt install ./bodovpn-vX.Y.Z-linux-x64.deb` (the `.tar.gz` runs in place). Asks for your password when connecting, to create the VPN device. |
 | Android | `bodovpn-vX.Y.Z.apk` | Install the APK. The Google Play listing is coming. |
+| macOS (Apple Silicon and Intel) | `bodovpn-vX.Y.Z-macos.dmg` | Open the DMG and drag BodoVPN to Applications. On first launch macOS asks you to enable the "BodoVPN Tunnel" network extension. |
 
 Sign in with your Telegram account inside the app; subscriptions are sold at [bodovpn.com](https://bodovpn.com).
