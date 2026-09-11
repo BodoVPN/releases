@@ -1,0 +1,4 @@
+
+.agents/.sync-state.json
+
+.agents/**/__pycache__/
