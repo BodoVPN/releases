@@ -26,31 +26,24 @@ env:
   TAG: ${{ github.event.client_payload.tag || inputs.tag }}
 
 jobs:
-  # The release is created once, empty, so the two builders can attach in parallel
-  # without racing to create it.
+  # The release is created once, empty, so the builders can attach in parallel without
+  # racing to create it. It stays a DRAFT until every build is attached (see `publish`):
+  # a published release is "latest" at once, and the apps would be sent to downloads
+  # that don't exist yet.
   create-release:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: write
     steps:
-      - name: Check out the private source at the tag (for its version)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.TAG }}
-          token: ${{ secrets.SOURCE_TOKEN }}
-          sparse-checkout: pubspec.yaml
-          sparse-checkout-cone-mode: false
-
-      - name: Create (or reuse) the release
+      - name: Create (or reuse) the draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "release $TAG exists"
           else
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "BodoVPN $TAG" --notes "$(cat <<'EOF'
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --title "BodoVPN $TAG" --notes "$(cat <<'EOF'
           New BodoVPN release. Pick the file for your device under Assets:
 
           - **Windows** — run the `-windows-x64-setup.exe` installer (the `.zip` is there for a manual install). The app asks for administrator rights to create the VPN adapter.
@@ -69,34 +62,6 @@ jobs:
           EOF
           )"
           fi
-
-      # latest.json is what the backend's /api/client/app/latest reads: the version this
-      # release carries and the per-platform download to send each app to.
-      - name: Publish the update manifest
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION=$(grep -E '^version:' pubspec.yaml | sed -E 's/^version:[[:space:]]*//')
-          NAME=${VERSION%%+*}
-          CODE=${VERSION##*+}
-          BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
-          cat > latest.json <<EOF
-          {
-            "tag": "$TAG",
-            "versionName": "$NAME",
-            "versionCode": $CODE,
-            "downloads": {
-              "windows": "$BASE/bodovpn-$TAG-windows-x64-setup.exe",
-              "windowsZip": "$BASE/bodovpn-$TAG-windows-x64.zip",
-              "linux": "$BASE/bodovpn-$TAG-linux-x64.deb",
-              "linuxTar": "$BASE/bodovpn-$TAG-linux-x64.tar.gz",
-              "macos": "$BASE/bodovpn-$TAG-macos.dmg",
-              "android": "$BASE/bodovpn-$TAG.apk"
-            }
-          }
-          EOF
-          cat latest.json
-          gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber
 
   android:
     needs: create-release
@@ -391,3 +356,55 @@ jobs:
         run: |
           tar -C build/linux/x64/release -czf "bodovpn-$TAG-linux-x64.tar.gz" --transform "s,^bundle,bodovpn," bundle
           gh release upload "$TAG" "bodovpn-$TAG-linux-x64.tar.gz" "dist/bodovpn-$TAG-linux-x64.deb" --repo "$GITHUB_REPOSITORY" --clobber
+
+  # Runs only once every platform is attached, so the release never goes "latest" (and the
+  # apps are never told to update) while a download is still missing. A failed build leaves
+  # the draft unpublished; re-run the failed job and this one follows.
+  publish:
+    needs: [android, windows, macos, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the private source at the tag (for its version)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          sparse-checkout: pubspec.yaml
+          sparse-checkout-cone-mode: false
+
+      # latest.json is what the backend's /api/client/app/latest reads: the version this
+      # release carries and the per-platform download to send each app to.
+      - name: Attach the update manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(grep -E '^version:' pubspec.yaml | sed -E 's/^version:[[:space:]]*//')
+          NAME=${VERSION%%+*}
+          CODE=${VERSION##*+}
+          BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          cat > latest.json <<EOF
+          {
+            "tag": "$TAG",
+            "versionName": "$NAME",
+            "versionCode": $CODE,
+            "downloads": {
+              "windows": "$BASE/bodovpn-$TAG-windows-x64-setup.exe",
+              "windowsZip": "$BASE/bodovpn-$TAG-windows-x64.zip",
+              "linux": "$BASE/bodovpn-$TAG-linux-x64.deb",
+              "linuxTar": "$BASE/bodovpn-$TAG-linux-x64.tar.gz",
+              "macos": "$BASE/bodovpn-$TAG-macos.dmg",
+              "android": "$BASE/bodovpn-$TAG.apk"
+            }
+          }
+          EOF
+          cat latest.json
+          gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
