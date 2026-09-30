@@ -55,7 +55,7 @@ jobs:
         run: |
           echo "source commit: $(git rev-parse HEAD)"
           if flutter pub get > "$RUNNER_TEMP/verify.log" 2>&1 && make verify >> "$RUNNER_TEMP/verify.log" 2>&1; then
-            echo "make verify passed: $(grep -Eo '[+][0-9]+( ~[0-9]+)?: All tests passed' "$RUNNER_TEMP/verify.log" | tail -1)"
+            echo "make verify passed: $(grep -Eio '[0-9]+ tests? passed|All tests passed' "$RUNNER_TEMP/verify.log" | tail -1)"
           else
             echo "::error::make verify failed. The log stays private in this public repo: run make verify locally."
             exit 1
