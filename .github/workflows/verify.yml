@@ -1,0 +1,70 @@
+name: Verify client source
+
+# The private BodoVPN/bodovpn-client repo's `make verify` gate, run here because
+# public-repo Actions minutes are free. The source is checked out read-only with
+# SOURCE_TOKEN and never committed here.
+#
+# This repo is PUBLIC, and so are its run logs: the gate's output (analyzer findings,
+# test failures, generated-file diffs) is written to a file that is never printed or
+# uploaded. A failure says only that it failed; run `make verify` locally for the cause.
+#
+# Trigger: run it by hand (or `gh workflow run verify.yml -R BodoVPN/releases -f ref=<ref>`),
+# or `repository_dispatch` (event_type: verify, client_payload.ref).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit in BodoVPN/bodovpn-client"
+        required: true
+  repository_dispatch:
+    types: [verify]
+
+concurrency:
+  group: verify-${{ inputs.ref || github.event.client_payload.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPO: BodoVPN/bodovpn-client
+  REF: ${{ inputs.ref || github.event.client_payload.ref }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      - name: Resolve Flutter version from .fvmrc
+        id: fvm
+        run: echo "version=$(jq -r .flutter .fvmrc)" >> "$GITHUB_OUTPUT"
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ steps.fvm.outputs.version }}
+          cache: true
+
+      - name: make verify (output kept private)
+        run: |
+          echo "source commit: $(git rev-parse HEAD)"
+          if flutter pub get > "$RUNNER_TEMP/verify.log" 2>&1 && make verify >> "$RUNNER_TEMP/verify.log" 2>&1; then
+            echo "make verify passed: $(grep -Eo '[+][0-9]+( ~[0-9]+)?: All tests passed' "$RUNNER_TEMP/verify.log" | tail -1)"
+          else
+            echo "::error::make verify failed. The log stays private in this public repo: run make verify locally."
+            exit 1
+          fi
+
+      - name: Generated files are committed and current
+        run: |
+          stale="$(git status --porcelain | wc -l)"
+          if [ "$stale" -ne 0 ]; then
+            echo "::error::$stale generated file(s) are stale or uncommitted: run make verify and commit the result."
+            exit 1
+          fi
