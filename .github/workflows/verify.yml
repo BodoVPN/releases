@@ -140,3 +140,55 @@ jobs:
             echo "::error::C/C++ lint failed on Windows. The log stays private in this public repo: run make lint-cpp locally."
             exit 1
           fi
+
+  # swift-format + SwiftLint for the Apple engine and Runner targets (the client's phase 9d). Both
+  # need Xcode, so this half of the native lint runs on macOS; output stays private.
+  lint-swift:
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      # Same Xcode as the release build: swift-format ships with it.
+      - name: Select Xcode 26
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$XCODE" ]; then
+            echo "::error::No Xcode 26 on this runner image. Installed:"; ls -d /Applications/Xcode*.app; exit 1
+          fi
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          xcrun swift-format --version
+
+      # .swiftlint.yml pins the version (swiftlint_version); a ref from before phase 9d has none.
+      - name: SwiftLint
+        id: swiftlint
+        run: |
+          want="$(sed -n 's/^swiftlint_version: *//p' .swiftlint.yml 2>/dev/null)"
+          if [ -z "$want" ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; echo "No .swiftlint.yml pin at this ref"; exit 0; fi
+          curl -fsSL -o "$RUNNER_TEMP/swiftlint.zip" "https://github.com/realm/SwiftLint/releases/download/$want/portable_swiftlint.zip"
+          sum="$(gh api "repos/realm/SwiftLint/releases/tags/$want" -q '.assets[] | select(.name=="portable_swiftlint.zip") | .digest')"
+          echo "${sum#sha256:}  $RUNNER_TEMP/swiftlint.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/swiftlint.zip" -d "$RUNNER_TEMP/swiftlint"
+          echo "$RUNNER_TEMP/swiftlint" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/swiftlint/swiftlint" version
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: make lint-swift (output kept private)
+        if: steps.swiftlint.outputs.skip != 'true'
+        run: |
+          echo "source commit: $(git rev-parse HEAD)"
+          if make lint-swift > "$RUNNER_TEMP/lint-swift.log" 2>&1; then
+            echo "Swift lint passed"
+          else
+            echo "::error::Swift lint failed. The log stays private in this public repo: run make lint-swift locally."
+            exit 1
+          fi
