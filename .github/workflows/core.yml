@@ -16,6 +16,8 @@ on:
       libxray_tag:
         description: "XTLS/libXray tag to build (vYY.M.D)"
         required: true
+  push:
+    branches: [ci/core-build]
 
 concurrency:
   group: core-${{ inputs.libxray_tag }}-${{ github.ref }}
@@ -25,7 +27,7 @@ permissions:
   contents: read
 
 env:
-  LIBXRAY_TAG: ${{ inputs.libxray_tag }}
+  LIBXRAY_TAG: ${{ inputs.libxray_tag || 'v26.9.30' }}
   GO_VERSION: "1.27.1"
   GOTOOLCHAIN: local
   LIBXRAY_GOMOBILE_VERSION: v0.0.0-20260908204917-8b95e45f8d3e
@@ -268,7 +270,6 @@ jobs:
     permissions:
       contents: write
     env:
-      RELEASE: core-${{ inputs.libxray_tag }}
       LIBXRAY_COMMIT: ${{ needs.resolve.outputs.commit }}
     steps:
       - uses: actions/checkout@v7
@@ -303,6 +304,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          RELEASE="core-$LIBXRAY_TAG"
           TITLE="Xray core $LIBXRAY_TAG (libXray)"
           if gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE" dist/libxray-*.zip dist/manifest.json dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber

@@ -435,7 +435,7 @@ def cmd_manifest(args):
 
     manifest = {
         "schema": 1,
-        "release": env["RELEASE"],
+        "release": f"core-{env['LIBXRAY_TAG']}",
         "builtAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "build": {
             "repository": env["GITHUB_REPOSITORY"],
