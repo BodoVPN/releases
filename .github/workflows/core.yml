@@ -237,6 +237,7 @@ jobs:
         working-directory: libxray
         run: python build/main.py apple gomobile
 
+      # The xcframework sits at the zip root, the layout a SwiftPM binaryTarget expects.
       - &package-apple
         name: Smoke-check and package
         run: |
@@ -244,23 +245,31 @@ jobs:
           mkdir -p "$S"
           cp -R libxray/LibXray.xcframework "$S/"
           cp libxray/LICENSE "$S/"
-          PATCH=()
-          [ -f patch.json ] && PATCH=(--patch patch.json)
-          python ci/.github/scripts/core.py xcframework "$S/LibXray.xcframework" --require ios,ios-simulator,macos --out contents.json
-          python ci/.github/scripts/core.py info --src libxray --target "$TARGET" --contents contents.json "${PATCH[@]}" \
-            --tool "gomobile=$LIBXRAY_GOMOBILE_VERSION" \
-            --tool "xcode=$(xcodebuild -version | paste -sd ' ' -)" --out "stage/libxray-$TARGET.json"
-          SOURCE_DATE_EPOCH="$(git -C libxray log -1 --format=%ct)" python ci/.github/scripts/core.py zip "$S" "stage/libxray-$TARGET.zip"
+          python ci/.github/scripts/core.py xcframework "$S/LibXray.xcframework" --require ios,ios-simulator,macos \
+            --max-minos "${MAX_MINOS:-}" --out contents.json
+          SOURCE_DATE_EPOCH="$(git -C libxray log -1 --format=%ct)" python ci/.github/scripts/core.py zip --flat "$S" "stage/libxray-$TARGET.zip"
+
+      - &record-apple
+        name: Record the build
+        run: |
+          EXTRA=()
+          [ -f patch.json ] && EXTRA+=(--patch patch.json --tool "gomobile=$LIBXRAY_GOMOBILE_VERSION")
+          [ -f swiftpm.json ] && EXTRA+=(--merge swiftpm=swiftpm.json)
+          python ci/.github/scripts/core.py info --src libxray --target "$TARGET" --contents contents.json "${EXTRA[@]}" \
+            --tool "xcode=$(xcodebuild -version | paste -sd ' ' -)" \
+            --tool "cc=$(xcrun clang --version | head -1)" --out "stage/libxray-$TARGET.json"
 
       - *upload
 
-  # cgo: LibXray.xcframework of static libXray.a + libXray.h + module map (iOS, iOS simulator, macOS, tvOS).
+  # cgo: LibXray.xcframework of static libXray.a + libXray.h + module map (iOS, iOS simulator,
+  # macOS, tvOS). The one the Apple apps link (migration step 10d).
   apple-cgo:
     needs: resolve
     runs-on: macos-26
     timeout-minutes: 90
     env:
       TARGET: apple-cgo
+      MAX_MINOS: ios=15.0,macos=13.0
     steps:
       - *select-xcode
       - *checkout-ci
@@ -273,6 +282,13 @@ jobs:
         run: python build/main.py apple go
 
       - *package-apple
+
+      # Builds a macOS 13 executable against the zip as a SwiftPM binaryTarget, checks
+      # `swift package compute-checksum`, and calls CGoInvoke for the Xray version.
+      - name: Use the zip as a SwiftPM binaryTarget
+        run: python ci/.github/scripts/core.py swiftpm "stage/libxray-$TARGET.zip" --platform 13.0 --out swiftpm.json
+
+      - *record-apple
       - *upload
 
   publish:

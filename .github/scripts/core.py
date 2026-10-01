@@ -39,6 +39,9 @@ MANIFEST_NOTES = [
     "records as a module replace in the Go build info (moduleReplacePaths). See: "
     "https://github.com/2dust/AndroidLibXrayLite/blob/d0c6c4ae1b09c912070c8288bd0dbcc2e492ac29/.github/workflows/main.yml, "
     "https://github.com/KaringX/sing-box/blob/73603b201141ee9bab41af76995808ccfc45209f/cmd/internal/build_libbox/main.go",
+    "The Apple zips hold LibXray.xcframework at their root, the layout a SwiftPM binaryTarget expects. "
+    "libxray-apple-cgo.zip is built and run from a SwiftPM package in CI (assets[].contents.swiftpm): the "
+    "importing target links CoreFoundation, Security and libresolv, which the Go runtime needs.",
     "The release files carry a Sigstore build-provenance attestation: "
     "gh attestation verify <file> -R BodoVPN/releases.",
 ]
@@ -126,10 +129,12 @@ def cmd_zip(args):
         info.external_attr = mode << 16
         return info
 
+    prefix = "" if args.flat else f"{src.name}/"
     with zipfile.ZipFile(args.out, "w") as archive:
-        archive.writestr(entry(f"{src.name}/", stat.S_IFDIR | 0o755), b"")
+        if prefix:
+            archive.writestr(entry(prefix, stat.S_IFDIR | 0o755), b"")
         for path in zip_entries(src):
-            name = f"{src.name}/{path.relative_to(src).as_posix()}"
+            name = f"{prefix}{path.relative_to(src).as_posix()}"
             if path.is_symlink():
                 archive.writestr(entry(name, stat.S_IFLNK | 0o777), os.readlink(path))
             elif path.is_dir():
@@ -292,6 +297,34 @@ def exports(path, symbols):
     return symbols
 
 
+VERSION_REQUEST = json.dumps({"apiVersion": 3, "method": "xrayVersion"})
+
+
+def parse_version_response(text, label):
+    try:
+        response = json.loads(text)
+    except ValueError:
+        fail(f"{label}: xrayVersion returned {text!r}")
+    if not response.get("success") or not response.get("data", {}).get("version"):
+        fail(f"{label}: xrayVersion failed: {text}")
+    return response["data"]["version"]
+
+
+def invoke_version(path):
+    import ctypes
+
+    lib = ctypes.CDLL(str(path.resolve()))
+    lib.CGoInvoke.restype = ctypes.c_void_p
+    lib.CGoInvoke.argtypes = [ctypes.c_char_p]
+    lib.CGoFree.argtypes = [ctypes.c_void_p]
+    pointer = lib.CGoInvoke(VERSION_REQUEST.encode())
+    if not pointer:
+        fail(f"{path.name}: CGoInvoke returned NULL")
+    text = ctypes.string_at(pointer).decode("utf-8")
+    lib.CGoFree(pointer)
+    return parse_version_response(text, path.name)
+
+
 def probe(cmd):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -315,6 +348,8 @@ def cmd_desktop(args):
             fail(f"{path.name} keeps {', '.join(info['debugSections'])}: it was built without -s -w")
         info["moduleReplacePaths"] = check_build_paths(path.name, path.read_bytes())
     exported = exports(lib, ["CGoInvoke", "CGoFree"])
+    runtime_version = invoke_version(lib)
+    print(f"{args.lib} xrayVersion -> {runtime_version}")
 
     help_run = subprocess.run([str(exe.resolve()), "-h"], capture_output=True, text=True, timeout=30)
     usage = help_run.stdout.strip()
@@ -333,6 +368,7 @@ def cmd_desktop(args):
     write_json(args.out, {
         "binaries": {args.exe: exe_info, args.lib: lib_info},
         "libraryExports": exported,
+        "runtimeXrayVersion": runtime_version,
         "cli": {"usage": usage, "noArguments": bare, "probes": probes},
     })
 
@@ -387,11 +423,32 @@ def slice_name(lib):
     return name
 
 
+IOS_MEMORY_LIMIT = b"github.com/xtls/libxray/memory.forceFree"
+
+
+def version_tuple(text):
+    return tuple(int(p) for p in text.split("."))
+
+
+def min_os_versions(binary):
+    versions, command = set(), ""
+    for line in run(["otool", "-arch", "all", "-l", str(binary)]).splitlines():
+        line = line.strip()
+        if line.startswith("cmd "):
+            command = line.split()[1]
+        elif command == "LC_BUILD_VERSION" and line.startswith("minos "):
+            versions.add(line.split()[1])
+        elif command.startswith("LC_VERSION_MIN_") and line.startswith("version "):
+            versions.add(line.split()[1])
+    return sorted(versions, key=version_tuple)
+
+
 def cmd_xcframework(args):
     root = Path(args.path)
     plist = root / "Info.plist"
     if not plist.is_file():
         fail(f"{root} has no Info.plist")
+    max_minos = dict(pair.split("=") for pair in args.max_minos.split(",")) if args.max_minos else {}
     libraries = plistlib.loads(plist.read_bytes()).get("AvailableLibraries", [])
     slices = []
     for lib in sorted(libraries, key=lambda l: l["LibraryIdentifier"]):
@@ -409,30 +466,114 @@ def cmd_xcframework(args):
             header_dir = root / lib["LibraryIdentifier"] / lib.get("HeadersPath", "Headers")
             headers = sorted(p.name for p in header_dir.glob("*.h"))
             modulemap = (header_dir / "module.modulemap").is_file()
+        ident = lib["LibraryIdentifier"]
         if not binary.exists() or binary.stat().st_size == 0:
-            fail(f"{lib['LibraryIdentifier']}: missing binary {binary}")
-        replaced = check_build_paths(lib["LibraryIdentifier"], binary.read_bytes())
+            fail(f"{ident}: missing binary {binary}")
+        data = binary.read_bytes()
+        replaced = check_build_paths(ident, data)
         if not headers:
-            fail(f"{lib['LibraryIdentifier']}: no headers")
+            fail(f"{ident}: no headers")
         archs = run(["lipo", "-archs", str(binary)]).split()
         if sorted(archs) != sorted(lib["SupportedArchitectures"]):
-            fail(f"{lib['LibraryIdentifier']}: binary has {archs}, Info.plist says {lib['SupportedArchitectures']}")
+            fail(f"{ident}: binary has {archs}, Info.plist says {lib['SupportedArchitectures']}")
+        if kind == "library":
+            header_text = "".join(p.read_text(encoding="utf-8") for p in header_dir.glob("*.h"))
+            missing = [s for s in ("CGoInvoke", "CGoFree") if s not in header_text]
+            if missing or not modulemap:
+                fail(f"{ident}: the headers must declare CGoInvoke and CGoFree beside a module.modulemap")
+            symbols = run(["nm", "-gU", str(binary)])
+            if not all(re.search(rf"\b_{s}$", symbols, re.M) for s in ("CGoInvoke", "CGoFree")):
+                fail(f"{ident}: the archive does not define _CGoInvoke and _CGoFree")
+        minos = min_os_versions(binary)
+        platform, variant = lib["SupportedPlatform"], lib.get("SupportedPlatformVariant")
+        limit = max_minos.get(platform) if variant in (None, "simulator") else None
+        if limit and (not minos or version_tuple(minos[-1]) > version_tuple(limit)):
+            fail(f"{ident}: minimum OS {minos or 'unknown'} is above the required {platform} {limit}")
+        memory_limit = IOS_MEMORY_LIMIT in data
+        if platform == "ios" and variant in (None, "simulator") and not memory_limit:
+            fail(f"{ident}: built without the ios tag (libXray's iOS GC and memory limit are missing)")
         slices.append({
-            "identifier": lib["LibraryIdentifier"],
+            "identifier": ident,
             "slice": slice_name(lib),
             "architectures": archs,
             "kind": kind,
             "binaryType": run(["file", "-b", str(binary)]).splitlines()[0],
+            "minimumOS": minos,
+            "iosMemoryLimit": memory_limit,
             "headers": headers,
             "moduleMap": modulemap,
             "moduleReplacePaths": replaced,
         })
-        print(f"{lib['LibraryIdentifier']}: {kind}, {' '.join(archs)}, headers {', '.join(headers)}")
+        print(f"{ident}: {kind}, {' '.join(archs)}, min OS {', '.join(minos)}, iOS memory limit {memory_limit}, headers {', '.join(headers)}")
     found = {s["slice"] for s in slices}
     missing = sorted(set(args.require.split(",")) - found)
     if missing:
         fail(f"{root.name} lacks the {', '.join(missing)} slice(s); it has {', '.join(sorted(found))}")
     write_json(args.out, {"xcframework": root.name, "slices": slices})
+
+
+SWIFTPM_LINKER_SETTINGS = ['.linkedFramework("CoreFoundation")', '.linkedFramework("Security")', '.linkedLibrary("resolv")']
+SWIFTPM_PACKAGE = """// swift-tools-version:5.9
+import PackageDescription
+
+let package = Package(
+    name: "CoreSmoke",
+    platforms: [.macOS("@PLATFORM@")],
+    targets: [
+        .binaryTarget(name: "LibXray", path: "@ZIP@"),
+        .executableTarget(name: "smoke", dependencies: ["LibXray"], linkerSettings: [@LINKER@]),
+    ]
+)
+"""
+SWIFTPM_MAIN = """import Foundation
+import LibXray
+
+let request = strdup(#"@REQUEST@"#)
+defer { free(request) }
+guard let response = CGoInvoke(request) else { fatalError("CGoInvoke returned NULL") }
+print(String(cString: response))
+CGoFree(response)
+"""
+
+
+def cmd_swiftpm(args):
+    """Consume the zip the way the app will: a SwiftPM binaryTarget, imported from Swift."""
+    import shutil
+
+    archive = Path(args.zip).resolve()
+    work = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "swiftpm-smoke"
+    shutil.rmtree(work, ignore_errors=True)
+    (work / "Sources" / "smoke").mkdir(parents=True)
+    shutil.copy(archive, work / archive.name)
+    (work / "Package.swift").write_text(
+        SWIFTPM_PACKAGE.replace("@PLATFORM@", args.platform).replace("@ZIP@", archive.name)
+        .replace("@LINKER@", ", ".join(SWIFTPM_LINKER_SETTINGS)), encoding="utf-8")
+    (work / "Sources" / "smoke" / "main.swift").write_text(
+        SWIFTPM_MAIN.replace("@REQUEST@", VERSION_REQUEST), encoding="utf-8")
+
+    checksum = run(["swift", "package", "compute-checksum", archive.name], cwd=work)
+    if checksum != sha256(archive):
+        fail(f"swift package compute-checksum gave {checksum}, not the zip's sha256")
+    build = subprocess.run(["swift", "build", "-c", "release"], cwd=work, capture_output=True, text=True)
+    output = build.stdout + build.stderr
+    print(output)
+    if build.returncode != 0:
+        fail("the SwiftPM smoke package does not build against the xcframework")
+    newer = [l.strip() for l in output.splitlines() if "built for newer" in l]
+    if newer:
+        fail(f"the xcframework targets a newer macOS than {args.platform}: {newer[0]}")
+    binary = Path(run(["swift", "build", "-c", "release", "--show-bin-path"], cwd=work)) / "smoke"
+    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        fail(f"the SwiftPM smoke binary exited {result.returncode}: {result.stderr.strip()}")
+    version = parse_version_response(result.stdout.strip(), "SwiftPM smoke")
+    print(f"SwiftPM: checksum {checksum}; macOS {args.platform} executable calls CGoInvoke -> Xray {version}")
+    write_json(args.out, {
+        "checksum": checksum,
+        "deploymentTarget": f"macOS {args.platform}",
+        "linkerSettings": SWIFTPM_LINKER_SETTINGS,
+        "runtimeXrayVersion": version,
+    })
 
 
 def core_version(module_dir):
@@ -455,6 +596,10 @@ def cmd_info(args):
     for pair in args.tool or []:
         key, _, value = pair.partition("=")
         tools[key] = value.strip()
+    contents = json.loads(Path(args.contents).read_text(encoding="utf-8"))
+    for pair in args.merge or []:
+        key, _, path = pair.partition("=")
+        contents[key] = json.loads(Path(path).read_text(encoding="utf-8"))
     write_json(args.out, {
         "target": args.target,
         "asset": f"libxray-{args.target}.zip",
@@ -467,7 +612,7 @@ def cmd_info(args):
         "xrayCore": {"moduleVersion": module_version, "version": core_version(module_dir)},
         "toolchain": tools,
         "buildPatch": json.loads(Path(args.patch).read_text(encoding="utf-8")) if args.patch else None,
-        "contents": json.loads(Path(args.contents).read_text(encoding="utf-8")),
+        "contents": contents,
     })
 
 
@@ -492,8 +637,9 @@ def sha256(path):
 
 def zip_listing(path):
     with zipfile.ZipFile(path) as archive:
-        names = {"/".join(n.rstrip("/").split("/")[1:2]) for n in archive.namelist()}
-    return sorted(n for n in names if n)
+        parts = [n.rstrip("/").split("/") for n in archive.namelist()]
+    depth = 1 if {p[0] for p in parts} == {path.stem} else 0
+    return sorted({p[depth] for p in parts if len(p) > depth})
 
 
 def cmd_manifest(args):
@@ -522,11 +668,20 @@ def cmd_manifest(args):
         path = dist / info["asset"]
         if not path.is_file():
             fail(f"missing {path}")
+        digest = sha256(path)
+        contents = info["contents"]
+        swiftpm = contents.get("swiftpm")
+        if swiftpm and swiftpm["checksum"] != digest:
+            fail(f"{target}: the SwiftPM checksum {swiftpm['checksum']} is not the zip's sha256 {digest}")
+        for runtime in (contents.get("runtimeXrayVersion"), (swiftpm or {}).get("runtimeXrayVersion")):
+            if runtime and runtime != version:
+                fail(f"{target} reports Xray {runtime} at runtime, but its module is {version}")
         assets.append({
             "name": info["asset"],
             "target": target,
             "size": path.stat().st_size,
-            "sha256": sha256(path),
+            "sha256": digest,
+            **({"swiftpmChecksum": swiftpm["checksum"]} if swiftpm else {}),
             "files": zip_listing(path),
             "runner": info["runner"],
             "toolchain": info["toolchain"],
@@ -583,7 +738,10 @@ def describe(asset):
         return f"`libXray.aar` ({', '.join(contents['abis'])}; minSdk {contents['minSdk']}) + sources jar"
     if "slices" in contents:
         kinds = sorted({s["kind"] for s in contents["slices"]})
-        return f"`{contents['xcframework']}` ({'/'.join(kinds)}): " + ", ".join(s["identifier"] for s in contents["slices"])
+        text = f"`{contents['xcframework']}` ({'/'.join(kinds)}): " + ", ".join(s["identifier"] for s in contents["slices"])
+        if asset.get("swiftpmChecksum"):
+            text += f". SwiftPM `binaryTarget` checksum `{asset['swiftpmChecksum']}`"
+        return text
     names = list(contents["binaries"])
     return f"`{names[1]}` + `libXray.h` + desktop `{names[0]}` (`xray run` only)"
 
@@ -614,6 +772,7 @@ def main():
     p = sub.add_parser("zip")
     p.add_argument("src")
     p.add_argument("out")
+    p.add_argument("--flat", action="store_true", help="put src's contents at the zip root (SwiftPM binaryTarget layout)")
     p.set_defaults(func=cmd_zip)
 
     p = sub.add_parser("desktop")
@@ -632,14 +791,22 @@ def main():
     p = sub.add_parser("xcframework")
     p.add_argument("path")
     p.add_argument("--require", required=True)
+    p.add_argument("--max-minos", default="", help="e.g. ios=15.0,macos=13.0")
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_xcframework)
+
+    p = sub.add_parser("swiftpm")
+    p.add_argument("zip")
+    p.add_argument("--platform", required=True, help="the smoke package's macOS deployment target, e.g. 13")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=cmd_swiftpm)
 
     p = sub.add_parser("info")
     p.add_argument("--src", required=True)
     p.add_argument("--target", required=True, choices=TARGETS)
     p.add_argument("--contents", required=True)
     p.add_argument("--tool", action="append")
+    p.add_argument("--merge", action="append", help="key=file: add a JSON file to contents under key")
     p.add_argument("--patch")
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_info)
