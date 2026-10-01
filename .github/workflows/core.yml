@@ -246,7 +246,7 @@ jobs:
           cp -R libxray/LibXray.xcframework "$S/"
           cp libxray/LICENSE "$S/"
           python ci/.github/scripts/core.py xcframework "$S/LibXray.xcframework" --require ios,ios-simulator,macos \
-            --max-minos "${MAX_MINOS:-}" --out contents.json
+            --max-minos "${MAX_MINOS:-}" --headers-subdir "${HEADERS_SUBDIR:-}" --out contents.json
           SOURCE_DATE_EPOCH="$(git -C libxray log -1 --format=%ct)" python ci/.github/scripts/core.py zip --flat "$S" "stage/libxray-$TARGET.zip"
 
       - &record-apple
@@ -255,6 +255,7 @@ jobs:
           EXTRA=()
           [ -f patch.json ] && EXTRA+=(--patch patch.json --tool "gomobile=$LIBXRAY_GOMOBILE_VERSION")
           [ -f swiftpm.json ] && EXTRA+=(--merge swiftpm=swiftpm.json)
+          [ -f headers.json ] && EXTRA+=(--merge headerLayout=headers.json)
           python ci/.github/scripts/core.py info --src libxray --target "$TARGET" --contents contents.json "${EXTRA[@]}" \
             --tool "xcode=$(xcodebuild -version | paste -sd ' ' -)" \
             --tool "cc=$(xcrun clang --version | head -1)" --out "stage/libxray-$TARGET.json"
@@ -270,6 +271,7 @@ jobs:
     env:
       TARGET: apple-cgo
       MAX_MINOS: ios=15.0,macos=13.0
+      HEADERS_SUBDIR: LibXray
     steps:
       - *select-xcode
       - *checkout-ci
@@ -280,6 +282,12 @@ jobs:
       - name: Build
         working-directory: libxray
         run: python build/main.py apple go
+
+      # Xcode copies every static library's headers into one include/, so libXray's
+      # Headers/module.modulemap collides with any other xcframework that ships one (the
+      # iOS app's Tun2SocksKit does). Headers/LibXray/ keeps `import LibXray` working.
+      - name: Nest the headers under Headers/LibXray
+        run: python ci/.github/scripts/core.py nest-headers libxray/LibXray.xcframework --module LibXray --out headers.json
 
       - *package-apple
 

@@ -41,7 +41,9 @@ MANIFEST_NOTES = [
     "https://github.com/KaringX/sing-box/blob/73603b201141ee9bab41af76995808ccfc45209f/cmd/internal/build_libbox/main.go",
     "The Apple zips hold LibXray.xcframework at their root, the layout a SwiftPM binaryTarget expects. "
     "libxray-apple-cgo.zip is built and run from a SwiftPM package in CI (assets[].contents.swiftpm): the "
-    "importing target links CoreFoundation, Security and libresolv, which the Go runtime needs.",
+    "importing target links CoreFoundation, Security and libresolv, which the Go runtime needs. Its header "
+    "and module map sit in each slice's Headers/LibXray/ (libXray ships them in Headers/), so they don't collide "
+    "with another xcframework's Headers/module.modulemap in Xcode's shared include/ directory.",
     "The release files carry a Sigstore build-provenance attestation: "
     "gh attestation verify <file> -R BodoVPN/releases.",
 ]
@@ -443,6 +445,46 @@ def min_os_versions(binary):
     return sorted(versions, key=version_tuple)
 
 
+def check_module_maps(ident, header_dir, subdir):
+    """Each module map's headers must resolve; with subdir, everything sits in Headers/<subdir>/."""
+    maps = sorted(header_dir.rglob("module.modulemap"))
+    for path in maps:
+        for name in re.findall(r'header\s+"([^"]+)"', path.read_text(encoding="utf-8")):
+            if not (path.parent / name).is_file():
+                fail(f"{ident}: {path.relative_to(header_dir)} names {name}, which is not beside it")
+    if subdir:
+        top = sorted(p.name for p in header_dir.iterdir())
+        if top != [subdir] or not (header_dir / subdir / "module.modulemap").is_file():
+            fail(f"{ident}: expected only {header_dir.name}/{subdir}/ holding the headers and module map, found {top}")
+    return bool(maps)
+
+
+def cmd_nest_headers(args):
+    """Move every library slice's headers and module map into Headers/<module>/.
+
+    Xcode copies each static library's headers into one shared include/ directory, so two
+    xcframeworks that both ship Headers/module.modulemap collide ("Multiple commands
+    produce .../include/module.modulemap"). Clang finds <include>/<Module>/module.modulemap
+    for `import <Module>`, so a per-module subdirectory keeps the import unchanged.
+    """
+    root = Path(args.path)
+    moved = {}
+    for lib in plistlib.loads((root / "Info.plist").read_bytes())["AvailableLibraries"]:
+        if lib["LibraryPath"].endswith(".framework"):
+            continue
+        headers = root / lib["LibraryIdentifier"] / lib.get("HeadersPath", "Headers")
+        target = headers / args.module
+        target.mkdir()
+        for item in sorted(headers.iterdir()):
+            if item != target:
+                item.rename(target / item.name)
+        moved[lib["LibraryIdentifier"]] = sorted(f"{headers.name}/{args.module}/{p.name}" for p in target.iterdir())
+        print(f"{lib['LibraryIdentifier']}: {', '.join(moved[lib['LibraryIdentifier']])}")
+    if not moved:
+        fail(f"{root.name} has no library slices to nest")
+    write_json(args.out, {"module": args.module, "slices": moved})
+
+
 def cmd_xcframework(args):
     root = Path(args.path)
     plist = root / "Info.plist"
@@ -464,8 +506,8 @@ def cmd_xcframework(args):
             kind = "library"
             binary = path
             header_dir = root / lib["LibraryIdentifier"] / lib.get("HeadersPath", "Headers")
-            headers = sorted(p.name for p in header_dir.glob("*.h"))
-            modulemap = (header_dir / "module.modulemap").is_file()
+            headers = sorted(p.relative_to(header_dir).as_posix() for p in header_dir.rglob("*.h"))
+            modulemap = check_module_maps(lib["LibraryIdentifier"], header_dir, args.headers_subdir)
         ident = lib["LibraryIdentifier"]
         if not binary.exists() or binary.stat().st_size == 0:
             fail(f"{ident}: missing binary {binary}")
@@ -477,7 +519,7 @@ def cmd_xcframework(args):
         if sorted(archs) != sorted(lib["SupportedArchitectures"]):
             fail(f"{ident}: binary has {archs}, Info.plist says {lib['SupportedArchitectures']}")
         if kind == "library":
-            header_text = "".join(p.read_text(encoding="utf-8") for p in header_dir.glob("*.h"))
+            header_text = "".join(p.read_text(encoding="utf-8") for p in header_dir.rglob("*.h"))
             missing = [s for s in ("CGoInvoke", "CGoFree") if s not in header_text]
             if missing or not modulemap:
                 fail(f"{ident}: the headers must declare CGoInvoke and CGoFree beside a module.modulemap")
@@ -792,8 +834,15 @@ def main():
     p.add_argument("path")
     p.add_argument("--require", required=True)
     p.add_argument("--max-minos", default="", help="e.g. ios=15.0,macos=13.0")
+    p.add_argument("--headers-subdir", default="", help="require library headers under Headers/<this>/")
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_xcframework)
+
+    p = sub.add_parser("nest-headers")
+    p.add_argument("path")
+    p.add_argument("--module", required=True)
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=cmd_nest_headers)
 
     p = sub.add_parser("swiftpm")
     p.add_argument("zip")
