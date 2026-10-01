@@ -189,7 +189,8 @@ jobs:
       - name: SwiftLint
         id: swiftlint
         run: |
-          want="$(sed -n 's/^swiftlint_version: *//p' .swiftlint.yml 2>/dev/null)"
+          want=""
+          if [ -f .swiftlint.yml ]; then want="$(sed -n 's/^swiftlint_version: *//p' .swiftlint.yml)"; fi
           if [ -z "$want" ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; echo "No .swiftlint.yml pin at this ref"; exit 0; fi
           curl -fsSL -o "$RUNNER_TEMP/swiftlint.zip" "https://github.com/realm/SwiftLint/releases/download/$want/portable_swiftlint.zip"
           sum="$(gh api "repos/realm/SwiftLint/releases/tags/$want" -q '.assets[] | select(.name=="portable_swiftlint.zip") | .digest')"
