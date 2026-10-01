@@ -51,6 +51,14 @@ jobs:
           flutter-version: ${{ steps.fvm.outputs.version }}
           cache: true
 
+      # make verify's lint-native step (the client's migration phase 9) needs these.
+      - name: Native lint tools
+        run: |
+          command -v shellcheck >/dev/null || sudo apt-get install -y shellcheck
+          pwsh -NoProfile -Command 'if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) { Install-Module PSScriptAnalyzer -Scope CurrentUser -Force }'
+          shellcheck --version | sed -n 2p
+          pwsh -NoProfile -Command '"PSScriptAnalyzer " + (Get-Module -ListAvailable PSScriptAnalyzer | Select-Object -First 1).Version'
+
       - name: make verify (output kept private)
         run: |
           echo "source commit: $(git rev-parse HEAD)"
