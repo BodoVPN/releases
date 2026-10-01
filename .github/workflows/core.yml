@@ -18,8 +18,6 @@ on:
       libxray_tag:
         description: "XTLS/libXray tag to build (vYY.M.D)"
         required: true
-  push:
-    branches: [ci/core-build]
 
 concurrency:
   group: core-${{ inputs.libxray_tag }}-${{ github.ref }}
@@ -29,7 +27,7 @@ permissions:
   contents: read
 
 env:
-  LIBXRAY_TAG: ${{ inputs.libxray_tag || 'v26.9.30' }}
+  LIBXRAY_TAG: ${{ inputs.libxray_tag }}
   GO_VERSION: "1.27.1"
   GOTOOLCHAIN: local
   LIBXRAY_GOMOBILE_VERSION: v0.0.0-20260908204917-8b95e45f8d3e
