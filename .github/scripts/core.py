@@ -304,7 +304,7 @@ def cmd_xcframework(args):
             binary = path / Path(lib["LibraryPath"]).stem
             if lib.get("BinaryPath"):
                 binary = root / lib["LibraryIdentifier"] / lib["BinaryPath"]
-            headers = sorted(p.name for p in path.glob("**/Headers/*.h"))
+            headers = sorted({p.name for p in path.glob("**/Headers/*.h")})
             modulemap = any(path.glob("**/Modules/module.modulemap"))
         else:
             kind = "library"
