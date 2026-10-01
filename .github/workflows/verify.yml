@@ -31,7 +31,7 @@ env:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     permissions:
       contents: read
     steps:
@@ -46,6 +46,13 @@ jobs:
         id: fvm
         run: echo "version=$(jq -r .flutter .fvmrc)" >> "$GITHUB_OUTPUT"
 
+      # Gradle (Android Lint) and the pinned ktlint/detekt CLIs run on it. No Gradle cache: this
+      # repo is public, and a cache of the private build is not something to hand out.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           flutter-version: ${{ steps.fvm.outputs.version }}
@@ -58,6 +65,7 @@ jobs:
           pwsh -NoProfile -Command 'if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) { Install-Module PSScriptAnalyzer -Scope CurrentUser -Force }'
           shellcheck --version | sed -n 2p
           pwsh -NoProfile -Command '"PSScriptAnalyzer " + (Get-Module -ListAvailable PSScriptAnalyzer | Select-Object -First 1).Version'
+          java -version 2>&1 | head -1
 
       # make verify's lint-cpp step (phase 9c): clang-format and clang-tidy pinned to LLVM 23 like
       # the client's tool/lint_cpp.sh, GTK and Flutter's Linux engine headers for the GTK runner.
@@ -74,11 +82,16 @@ jobs:
           /usr/lib/llvm-23/bin/clang-format --version
           /usr/lib/llvm-23/bin/clang-tidy --version | sed -n 2p
 
+      # `flutter build apk --config-only` writes the Gradle wrapper and local.properties that
+      # make lint-android runs on, without building anything.
       - name: make verify (output kept private)
         run: |
           echo "source commit: $(git rev-parse HEAD)"
-          if flutter pub get > "$RUNNER_TEMP/verify.log" 2>&1 && make verify >> "$RUNNER_TEMP/verify.log" 2>&1; then
-            echo "make verify passed: $(grep -Eio '[0-9]+ tests? passed|All tests passed' "$RUNNER_TEMP/verify.log" | tail -1)"
+          log="$RUNNER_TEMP/verify.log"
+          if flutter pub get > "$log" 2>&1 \
+            && flutter build apk --config-only >> "$log" 2>&1 \
+            && make verify >> "$log" 2>&1; then
+            echo "make verify passed: $(grep -Eio '[0-9]+ tests? passed|All tests passed' "$log" | tail -1)"
           else
             echo "::error::make verify failed. The log stays private in this public repo: run make verify locally."
             exit 1
