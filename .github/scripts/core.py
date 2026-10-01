@@ -35,7 +35,8 @@ MANIFEST_NOTES = [
     "Every native binary is checked to be stripped (-s -w) and free of build-machine paths (-trimpath). "
     "libXray's cgo, Linux and Windows builds already pass these flags; its gomobile bind commands (android, "
     "apple gomobile) pass neither, so this build adds them there (assets[].buildPatch). Other clients' gomobile "
-    "builds strip and trim the same way: "
+    "builds strip and trim the same way. The one path -trimpath can't remove is the checkout directory gomobile "
+    "records as a module replace in the Go build info (moduleReplacePaths). See: "
     "https://github.com/2dust/AndroidLibXrayLite/blob/d0c6c4ae1b09c912070c8288bd0dbcc2e492ac29/.github/workflows/main.yml, "
     "https://github.com/KaringX/sing-box/blob/73603b201141ee9bab41af76995808ccfc45209f/cmd/internal/build_libbox/main.go",
     "The release files carry a Sigstore build-provenance attestation: "
@@ -201,12 +202,25 @@ def build_path_prefixes():
 PATH_PREFIXES = []
 
 
+MODINFO_REPLACE = re.compile(rb"\n=>\t([^\t\n]+)\t")
+
+
 def check_build_paths(label, data):
+    """Fail on build-machine paths, except a module replace target in the Go build info.
+
+    gomobile builds a generated module that replaces the bound module with its checkout
+    directory, and the Go build info records that directory even under -trimpath.
+    """
     if not PATH_PREFIXES:
         PATH_PREFIXES.extend(build_path_prefixes())
-    leaked = [p.decode() for p in PATH_PREFIXES if p in data]
-    if leaked:
-        fail(f"{label} embeds build-machine paths ({', '.join(leaked)}): it was built without -trimpath")
+    replaced = sorted({m.group(1).decode() for m in MODINFO_REPLACE.finditer(data)})
+    scrubbed = MODINFO_REPLACE.sub(b"\n=>\t\t", data)
+    for prefix in PATH_PREFIXES:
+        at = scrubbed.find(prefix)
+        if at >= 0:
+            context = scrubbed[max(0, at - 40):at + 120].decode("utf-8", "replace")
+            fail(f"{label} embeds the build-machine path {prefix.decode()}: {context!r}")
+    return replaced
 
 
 def pe_machine(data, label):
@@ -299,7 +313,7 @@ def cmd_desktop(args):
             fail(f"{path.name} is {info['machine']}, expected {args.machine}")
         if info.get("stripped") is False:
             fail(f"{path.name} keeps {', '.join(info['debugSections'])}: it was built without -s -w")
-        check_build_paths(path.name, path.read_bytes())
+        info["moduleReplacePaths"] = check_build_paths(path.name, path.read_bytes())
     exported = exports(lib, ["CGoInvoke", "CGoFree"])
 
     help_run = subprocess.run([str(exe.resolve()), "-h"], capture_output=True, text=True, timeout=30)
@@ -341,7 +355,7 @@ def cmd_aar(args):
             info = elf_info(data, name)
             if not info["stripped"]:
                 fail(f"{name} keeps {', '.join(info['debugSections'])}: it was built without -s -w")
-            check_build_paths(name, data)
+            info["moduleReplacePaths"] = check_build_paths(name, data)
             info["file"] = name.split("/")[2]
             info["size"] = archive.getinfo(name).file_size
             abis.setdefault(abi, []).append(info)
@@ -397,7 +411,7 @@ def cmd_xcframework(args):
             modulemap = (header_dir / "module.modulemap").is_file()
         if not binary.exists() or binary.stat().st_size == 0:
             fail(f"{lib['LibraryIdentifier']}: missing binary {binary}")
-        check_build_paths(lib["LibraryIdentifier"], binary.read_bytes())
+        replaced = check_build_paths(lib["LibraryIdentifier"], binary.read_bytes())
         if not headers:
             fail(f"{lib['LibraryIdentifier']}: no headers")
         archs = run(["lipo", "-archs", str(binary)]).split()
@@ -411,6 +425,7 @@ def cmd_xcframework(args):
             "binaryType": run(["file", "-b", str(binary)]).splitlines()[0],
             "headers": headers,
             "moduleMap": modulemap,
+            "moduleReplacePaths": replaced,
         })
         print(f"{lib['LibraryIdentifier']}: {kind}, {' '.join(archs)}, headers {', '.join(headers)}")
     found = {s["slice"] for s in slices}
