@@ -29,7 +29,18 @@ ELF_MACHINES = {0x03: "x86", 0x28: "arm", 0x3E: "x86_64", 0xB7: "aarch64"}
 PE_MACHINES = {0x8664: "x86_64", 0xAA64: "aarch64", 0x014C: "x86"}
 PAGE_16K = 16384
 USAGE_PREFIX = "Usage: xray run"
+GOMOBILE_LDFLAGS = "-s -w -buildid="
 TARGETS = ["android", "apple-cgo", "apple-gomobile", "linux-x64", "windows-x64"]
+MANIFEST_NOTES = [
+    "Every native binary is checked to be stripped (-s -w) and free of build-machine paths (-trimpath). "
+    "libXray's cgo, Linux and Windows builds already pass these flags; its gomobile bind commands (android, "
+    "apple gomobile) pass neither, so this build adds them there (assets[].buildPatch). Other clients' gomobile "
+    "builds strip and trim the same way: "
+    "https://github.com/2dust/AndroidLibXrayLite/blob/d0c6c4ae1b09c912070c8288bd0dbcc2e492ac29/.github/workflows/main.yml, "
+    "https://github.com/KaringX/sing-box/blob/73603b201141ee9bab41af76995808ccfc45209f/cmd/internal/build_libbox/main.go",
+    "The release files carry a Sigstore build-provenance attestation: "
+    "gh attestation verify <file> -R BodoVPN/releases.",
+]
 
 
 def fail(message):
@@ -64,6 +75,30 @@ def cmd_resolve(args):
     print(f"XTLS/libXray {tag} = {commit}")
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
         out.write(f"commit={commit}\n")
+
+
+def cmd_patch_gomobile(args):
+    path = Path(args.src) / "build" / "app" / args.script
+    text = path.read_bytes().decode("utf-8")
+    if text.count('"bind",') != 1:
+        fail(f"{args.script}: expected one gomobile bind command")
+    ldflags = re.findall(r'"-ldflags=([^"]*)"', text)
+    if len(ldflags) > 1:
+        fail(f"{args.script}: expected at most one -ldflags")
+    added = []
+    if '"-trimpath"' not in text:
+        added.append('"-trimpath"')
+    if ldflags:
+        text = text.replace(f'"-ldflags={ldflags[0]}"', f'"-ldflags={GOMOBILE_LDFLAGS} {ldflags[0]}"')
+        final = f"{GOMOBILE_LDFLAGS} {ldflags[0]}"
+    else:
+        added.append(f'"-ldflags={GOMOBILE_LDFLAGS}"')
+        final = GOMOBILE_LDFLAGS
+    if added:
+        text = text.replace('"bind",', '"bind", ' + ", ".join(added) + ",")
+    path.write_bytes(text.encode("utf-8"))
+    print(f"{args.script}: gomobile bind -trimpath -ldflags='{final}'")
+    write_json(args.out, {"script": f"build/app/{args.script}", "trimpath": True, "ldflags": final})
 
 
 def zip_entries(src):
@@ -125,12 +160,53 @@ def elf_info(data, label):
             load_aligns.append(p_align)
         elif p_type == 3:
             interp = True
+    debug = sorted(n for n in elf_section_names(data, is64) if n == ".symtab" or n.startswith((".debug_", ".zdebug_")))
     return {
         "machine": ELF_MACHINES.get(machine, hex(machine)),
         "bits": 64 if is64 else 32,
         "loadAlign": min(load_aligns) if load_aligns else 0,
         "programInterpreter": interp,
+        "stripped": not debug,
+        "debugSections": debug,
     }
+
+
+def elf_section_names(data, is64):
+    if is64:
+        shoff, = struct.unpack_from("<Q", data, 0x28)
+        shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 0x3A)
+        layout = "<IIQQQQIIQQ"
+    else:
+        shoff, = struct.unpack_from("<I", data, 0x20)
+        shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 0x2E)
+        layout = "<IIIIIIIIII"
+    if shoff == 0 or shnum == 0:
+        return []
+    sections = [struct.unpack_from(layout, data, shoff + i * shentsize) for i in range(shnum)]
+    strtab = sections[shstrndx][4]
+    return [data[strtab + s[0]:data.index(b"\0", strtab + s[0])].decode() for s in sections]
+
+
+def build_path_prefixes():
+    values = {os.environ.get(v, "") for v in ("GITHUB_WORKSPACE", "RUNNER_TOOL_CACHE", "RUNNER_TEMP", "HOME", "USERPROFILE")}
+    values |= set(run(["go", "env", "GOROOT", "GOPATH", "GOMODCACHE"]).splitlines())
+    prefixes = set()
+    for value in values:
+        value = value.strip().rstrip("/\\")
+        if len(value) > 4:
+            prefixes |= {value, value.replace("\\", "/"), value.replace("/", "\\")}
+    return sorted(p.encode() for p in prefixes)
+
+
+PATH_PREFIXES = []
+
+
+def check_build_paths(label, data):
+    if not PATH_PREFIXES:
+        PATH_PREFIXES.extend(build_path_prefixes())
+    leaked = [p.decode() for p in PATH_PREFIXES if p in data]
+    if leaked:
+        fail(f"{label} embeds build-machine paths ({', '.join(leaked)}): it was built without -trimpath")
 
 
 def pe_machine(data, label):
@@ -218,9 +294,12 @@ def cmd_desktop(args):
         if not path.is_file() or path.stat().st_size == 0:
             fail(f"missing {path}")
     exe_info, lib_info = binary_machine(exe), binary_machine(lib)
-    for label, info in ((args.exe, exe_info), (args.lib, lib_info)):
+    for path, info in ((exe, exe_info), (lib, lib_info)):
         if info["machine"] != args.machine:
-            fail(f"{label} is {info['machine']}, expected {args.machine}")
+            fail(f"{path.name} is {info['machine']}, expected {args.machine}")
+        if info.get("stripped") is False:
+            fail(f"{path.name} keeps {', '.join(info['debugSections'])}: it was built without -s -w")
+        check_build_paths(path.name, path.read_bytes())
     exported = exports(lib, ["CGoInvoke", "CGoFree"])
 
     help_run = subprocess.run([str(exe.resolve()), "-h"], capture_output=True, text=True, timeout=30)
@@ -258,7 +337,11 @@ def cmd_aar(args):
         abis = {}
         for name in libs:
             abi = name.split("/")[1]
-            info = elf_info(archive.read(name), name)
+            data = archive.read(name)
+            info = elf_info(data, name)
+            if not info["stripped"]:
+                fail(f"{name} keeps {', '.join(info['debugSections'])}: it was built without -s -w")
+            check_build_paths(name, data)
             info["file"] = name.split("/")[2]
             info["size"] = archive.getinfo(name).file_size
             abis.setdefault(abi, []).append(info)
@@ -314,6 +397,7 @@ def cmd_xcframework(args):
             modulemap = (header_dir / "module.modulemap").is_file()
         if not binary.exists() or binary.stat().st_size == 0:
             fail(f"{lib['LibraryIdentifier']}: missing binary {binary}")
+        check_build_paths(lib["LibraryIdentifier"], binary.read_bytes())
         if not headers:
             fail(f"{lib['LibraryIdentifier']}: no headers")
         archs = run(["lipo", "-archs", str(binary)]).split()
@@ -367,6 +451,7 @@ def cmd_info(args):
         "libxrayCommit": run(["git", "rev-parse", "HEAD"], cwd=src),
         "xrayCore": {"moduleVersion": module_version, "version": core_version(module_dir)},
         "toolchain": tools,
+        "buildPatch": json.loads(Path(args.patch).read_text(encoding="utf-8")) if args.patch else None,
         "contents": json.loads(Path(args.contents).read_text(encoding="utf-8")),
     })
 
@@ -430,6 +515,7 @@ def cmd_manifest(args):
             "files": zip_listing(path),
             "runner": info["runner"],
             "toolchain": info["toolchain"],
+            "buildPatch": info["buildPatch"],
             "contents": info["contents"],
         })
 
@@ -467,6 +553,7 @@ def cmd_manifest(args):
             "xcode": env["XCODE_VERSION"],
             "python": env["PYTHON_VERSION"],
         },
+        "notes": MANIFEST_NOTES,
         "assets": assets,
     }
     write_json(dist / "manifest.json", manifest)
@@ -498,7 +585,8 @@ def write_notes(path, manifest):
         f"| Asset | Contents |\n| --- | --- |\n{rows}\n\n"
         f"Toolchain: Go {tool['go']}, gomobile {tool['gomobile']}, NDK {tool['ndk']} ({tool['ndkRevision']}), "
         f"{tool['androidPlatform']}, Java {tool['java']}, Xcode {tool['xcode']}.\n"
-        "Every pinned version and each asset's details are in `manifest.json`; checksums are in `SHA256SUMS`.\n",
+        "Every pinned version and each asset's details are in `manifest.json`; checksums are in `SHA256SUMS`. "
+        f"Verify a download with `gh attestation verify <file> -R {manifest['build']['repository']}`.\n",
         encoding="utf-8",
     )
 
@@ -537,8 +625,15 @@ def main():
     p.add_argument("--target", required=True, choices=TARGETS)
     p.add_argument("--contents", required=True)
     p.add_argument("--tool", action="append")
+    p.add_argument("--patch")
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_info)
+
+    p = sub.add_parser("patch-gomobile")
+    p.add_argument("--src", required=True)
+    p.add_argument("--script", required=True, choices=["android.py", "apple_gomobile.py"])
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=cmd_patch_gomobile)
 
     p = sub.add_parser("manifest")
     p.add_argument("dist")

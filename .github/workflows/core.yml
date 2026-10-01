@@ -5,6 +5,8 @@ name: Build the Xray core (libXray)
 # The apps take Xray from these builds, not from upstream's zips, so every toolchain
 # version is pinned below and recorded in manifest.json. A pre-release never becomes
 # "latest", so the app download page (this repo's latest release) is left alone.
+# Every native binary is checked to be stripped and free of runner paths, and every
+# release file gets a build-provenance attestation.
 #
 # Trigger: gh workflow run core.yml -R BodoVPN/releases -f libxray_tag=v26.9.30
 # Only a run from main publishes. A run from any other branch builds and checks every
@@ -47,7 +49,7 @@ jobs:
     outputs:
       commit: ${{ steps.tag.outputs.commit }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github/scripts
           persist-credentials: false
@@ -65,7 +67,7 @@ jobs:
     steps:
       - &checkout-ci
         name: Check out the build helpers
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: ci
           sparse-checkout: .github/scripts
@@ -73,7 +75,7 @@ jobs:
 
       - &checkout-libxray
         name: Check out XTLS/libXray at the resolved commit
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: XTLS/libXray
           ref: ${{ needs.resolve.outputs.commit }}
@@ -81,12 +83,12 @@ jobs:
           persist-credentials: false
 
       - &setup-python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - &setup-go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
@@ -106,7 +108,7 @@ jobs:
           SOURCE_DATE_EPOCH="$(git -C libxray log -1 --format=%ct)" python ci/.github/scripts/core.py zip "$S" "stage/libxray-$TARGET.zip"
 
       - &upload
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: core-${{ env.TARGET }}
           path: |
@@ -162,7 +164,7 @@ jobs:
       - *setup-python
       - *setup-go
 
-      - uses: actions/setup-java@v6
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
@@ -184,6 +186,11 @@ jobs:
             echo "ANDROID_NDK_HOME=$NDK"
           } >> "$GITHUB_ENV"
 
+      # libXray's gomobile command passes neither -trimpath nor -s -w (its cgo, Linux and
+      # Windows builds do), so its AAR carries runner paths and full symbols. Add both.
+      - name: Strip and trim libXray's gomobile build
+        run: python ci/.github/scripts/core.py patch-gomobile --src libxray --script android.py --out patch.json
+
       - name: Build
         working-directory: libxray
         run: python build/main.py android
@@ -194,7 +201,7 @@ jobs:
           mkdir -p "$S"
           cp libxray/libXray.aar libxray/libXray-sources.jar libxray/LICENSE "$S/"
           python ci/.github/scripts/core.py aar "$S/libXray.aar" --out contents.json
-          python ci/.github/scripts/core.py info --src libxray --target "$TARGET" --contents contents.json \
+          python ci/.github/scripts/core.py info --src libxray --target "$TARGET" --contents contents.json --patch patch.json \
             --tool "gomobile=$LIBXRAY_GOMOBILE_VERSION" \
             --tool "ndk=$NDK_VERSION ($(sed -n 's/^Pkg.Revision = //p' "$ANDROID_NDK_HOME/source.properties"))" \
             --tool "androidPlatform=$(ls "$ANDROID_HOME/platforms")" \
@@ -223,6 +230,9 @@ jobs:
       - *setup-python
       - *setup-go
 
+      - name: Strip and trim libXray's gomobile build
+        run: python ci/.github/scripts/core.py patch-gomobile --src libxray --script apple_gomobile.py --out patch.json
+
       - name: Build
         working-directory: libxray
         run: python build/main.py apple gomobile
@@ -234,8 +244,10 @@ jobs:
           mkdir -p "$S"
           cp -R libxray/LibXray.xcframework "$S/"
           cp libxray/LICENSE "$S/"
+          PATCH=()
+          [ -f patch.json ] && PATCH=(--patch patch.json)
           python ci/.github/scripts/core.py xcframework "$S/LibXray.xcframework" --require ios,ios-simulator,macos --out contents.json
-          python ci/.github/scripts/core.py info --src libxray --target "$TARGET" --contents contents.json \
+          python ci/.github/scripts/core.py info --src libxray --target "$TARGET" --contents contents.json "${PATCH[@]}" \
             --tool "gomobile=$LIBXRAY_GOMOBILE_VERSION" \
             --tool "xcode=$(xcodebuild -version | paste -sd ' ' -)" --out "stage/libxray-$TARGET.json"
           SOURCE_DATE_EPOCH="$(git -C libxray log -1 --format=%ct)" python ci/.github/scripts/core.py zip "$S" "stage/libxray-$TARGET.zip"
@@ -269,15 +281,18 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     env:
       LIBXRAY_COMMIT: ${{ needs.resolve.outputs.commit }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github/scripts
           persist-credentials: false
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: core-*
           path: dist
@@ -289,9 +304,16 @@ jobs:
           cat dist/SHA256SUMS
           cat dist/manifest.json
 
+      # Sigstore-signed SLSA provenance for every file in SHA256SUMS:
+      # gh attestation verify <file> -R BodoVPN/releases
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
       - name: Keep the release files with the run
         if: github.ref != 'refs/heads/main'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-preview
           path: |
