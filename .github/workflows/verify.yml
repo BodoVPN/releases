@@ -59,6 +59,21 @@ jobs:
           shellcheck --version | sed -n 2p
           pwsh -NoProfile -Command '"PSScriptAnalyzer " + (Get-Module -ListAvailable PSScriptAnalyzer | Select-Object -First 1).Version'
 
+      # make verify's lint-cpp step (phase 9c): clang-format and clang-tidy pinned to LLVM 23 like
+      # the client's tool/lint_cpp.sh, GTK and Flutter's Linux engine headers for the GTK runner.
+      # The Windows sources are tidied by the tidy-windows job below.
+      - name: C/C++ lint tools
+        run: |
+          codename="$(lsb_release -cs)"
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/$codename/ llvm-toolchain-$codename-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-format-23 clang-tidy-23 libgtk-3-dev >/dev/null
+          echo /usr/lib/llvm-23/bin >> "$GITHUB_PATH"
+          flutter precache --linux >/dev/null
+          /usr/lib/llvm-23/bin/clang-format --version
+          /usr/lib/llvm-23/bin/clang-tidy --version | sed -n 2p
+
       - name: make verify (output kept private)
         run: |
           echo "source commit: $(git rev-parse HEAD)"
@@ -74,5 +89,54 @@ jobs:
           stale="$(git status --porcelain | wc -l)"
           if [ "$stale" -ne 0 ]; then
             echo "::error::$stale generated file(s) are stale or uncommitted: run make verify and commit the result."
+            exit 1
+          fi
+
+  # clang-tidy for the Windows engine plugin, runner and setup stub (the client's phase 9c). They
+  # include <windows.h>, so this half of the C/C++ lint needs a Windows host; output stays private.
+  tidy-windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      - name: Resolve Flutter version from .fvmrc
+        id: fvm
+        run: echo "version=$(jq -r .flutter .fvmrc)" >> "$GITHUB_OUTPUT"
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ steps.fvm.outputs.version }}
+          cache: true
+
+      # The client's tool/lint_cpp.sh is pinned to LLVM 23; the image's own LLVM may be older.
+      - name: LLVM 23.1.2
+        shell: pwsh
+        run: |
+          $msi = "$env:RUNNER_TEMP\llvm.msi"
+          curl.exe -sSfL -o $msi https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.2/LLVM-23.1.2-win64.msi
+          if ((Get-FileHash $msi -Algorithm SHA256).Hash -ne 'E9D9141524F2C9FE4BF9F37012EFE34F0AA745617BE9E21FFACE9104703C55E5') { throw 'LLVM installer checksum mismatch' }
+          $install = Start-Process msiexec.exe -ArgumentList '/a', $msi, '/qn', "TARGETDIR=$env:RUNNER_TEMP\llvm" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "msiexec exited with $($install.ExitCode)" }
+          "$env:RUNNER_TEMP\llvm\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & "$env:RUNNER_TEMP\llvm\LLVM\bin\clang-tidy.exe" --version | Select-Object -Index 1
+
+      - name: C/C++ lint (output kept private)
+        run: |
+          echo "source commit: $(git rev-parse HEAD)"
+          if { flutter pub get && flutter precache --windows && bash tool/lint_cpp.sh; } > "$RUNNER_TEMP/lint-cpp.log" 2>&1; then
+            echo "C/C++ lint passed on Windows"
+          else
+            echo "::error::C/C++ lint failed on Windows. The log stays private in this public repo: run make lint-cpp locally."
             exit 1
           fi
