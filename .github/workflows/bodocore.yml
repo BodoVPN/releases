@@ -1,0 +1,360 @@
+name: Build the BodoVPN core (our Go module on libXray)
+
+# Builds core/, our Go module, into ONE library per platform that holds libXray and our
+# additions (warm pingBatchWarm, in-process queryStats, Android protect): a process may load
+# only one Go runtime, so the apps load this instead of libXray's build. libXray's version is
+# pinned in core/go.mod. Like core.yml, every toolchain is pinned, every binary is checked
+# stripped and free of runner paths, every library is smoke-tested through its real entry
+# points, and the release files get SHA256SUMS, manifest.json and a provenance attestation.
+#
+# Publish: gh workflow run bodocore.yml -R BodoVPN/releases -f build=1
+#   -> pre-release core-<libXray tag>-bodo.1. Only a dispatch from main publishes. Pull
+#   requests that touch the module build and test every target and keep the manifest.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: "Build number n of the pre-release core-<libXray tag>-bodo.<n>"
+        required: true
+  pull_request:
+    paths:
+      - core/**
+      - .github/workflows/bodocore.yml
+      - .github/scripts/bodocore.py
+      - .github/scripts/core.py
+
+concurrency:
+  group: bodocore-${{ github.event_name }}-${{ inputs.build || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.27.1"
+  GOTOOLCHAIN: local
+  GOMOBILE_VERSION: v0.0.0-20260908204917-8b95e45f8d3e
+  NDK_VERSION: r30
+  NDK_REVISION: "30.0.16248370"
+  ANDROID_PLATFORM: android-36
+  JAVA_VERSION: "21.0.12+8.0.LTS"
+  XCODE_VERSION: "26.6"
+  PYTHON_VERSION: "3.14.7"
+
+jobs:
+  # Unit tests (race detector on), formatting and the libXray pin, before any build.
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      release: ${{ steps.pin.outputs.release }}
+      libxray_tag: ${{ steps.pin.outputs.libxray_tag }}
+      libxray_version: ${{ steps.pin.outputs.libxray_version }}
+      libxray_commit: ${{ steps.pin.outputs.libxray_commit }}
+      xray_module_version: ${{ steps.pin.outputs.xray_module_version }}
+      xray_version: ${{ steps.pin.outputs.xray_version }}
+    steps:
+      - &checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - &setup-python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - &setup-go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Check the module
+        working-directory: core
+        run: |
+          go mod verify
+          go mod tidy -diff
+          unformatted="$(gofmt -l .)"
+          [ -z "$unformatted" ] || { echo "::error::gofmt: $unformatted"; exit 1; }
+          go vet ./...
+
+      - name: Unit tests
+        working-directory: core
+        run: go test -race -count=1 ./...
+
+      - name: Resolve the libXray pin
+        id: pin
+        env:
+          BUILD: ${{ inputs.build }}
+        run: python .github/scripts/bodocore.py resolve --src core --build "$BUILD"
+
+  linux-x64:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TARGET: linux-x64
+      LIB: libBodoCore.so
+      CGO_ENABLED: "1"
+      RELEASE: ${{ needs.test.outputs.release }}
+      LIBXRAY_COMMIT: ${{ needs.test.outputs.libxray_commit }}
+      LIBXRAY_VERSION: ${{ needs.test.outputs.libxray_version }}
+      XRAY_MODULE_VERSION: ${{ needs.test.outputs.xray_module_version }}
+      XRAY_VERSION: ${{ needs.test.outputs.xray_version }}
+    steps:
+      - *checkout
+      - *setup-python
+      - *setup-go
+
+      - &build-desktop
+        name: Build
+        working-directory: core
+        run: |
+          FLAGS="-s -w -buildid= -X github.com/bodovpn/releases/core/engine.release=$RELEASE"
+          echo "FLAGS=-trimpath -buildvcs=false -buildmode=c-shared -ldflags=$FLAGS" >> "$GITHUB_ENV"
+          go build -trimpath -buildvcs=false -buildmode=c-shared -ldflags "$FLAGS" -o "../out/$LIB" ./cbridge
+
+      - &package-desktop
+        name: Smoke-test and package
+        run: |
+          S="stage/bodocore-$TARGET"
+          mkdir -p "$S"
+          cp "out/$LIB" out/libBodoCore.h "$S/"
+          python .github/scripts/bodocore.py licenses --src core "$S"
+          python .github/scripts/bodocore.py desktop "$S" --lib "$LIB" --machine x86_64 --out contents.json \
+            --release "$RELEASE" --xray "$XRAY_VERSION" --libxray "$LIBXRAY_VERSION"
+          python .github/scripts/bodocore.py info --target "$TARGET" --contents contents.json --flags "$FLAGS" \
+            --tool "cc=$(gcc --version | head -1)" --out "stage/bodocore-$TARGET.json"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" python .github/scripts/bodocore.py zip "$S" "stage/bodocore-$TARGET.zip"
+
+      - &upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bodocore-${{ env.TARGET }}
+          path: |
+            stage/bodocore-${{ env.TARGET }}.zip
+            stage/bodocore-${{ env.TARGET }}.json
+          if-no-files-found: error
+
+  windows-x64:
+    needs: test
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: windows-x64
+      LIB: libBodoCore.dll
+      CGO_ENABLED: "1"
+      GOARCH: amd64
+      CC: gcc.exe
+      RELEASE: ${{ needs.test.outputs.release }}
+      LIBXRAY_COMMIT: ${{ needs.test.outputs.libxray_commit }}
+      LIBXRAY_VERSION: ${{ needs.test.outputs.libxray_version }}
+      XRAY_MODULE_VERSION: ${{ needs.test.outputs.xray_module_version }}
+      XRAY_VERSION: ${{ needs.test.outputs.xray_version }}
+    steps:
+      - *checkout
+      - *setup-python
+      - *setup-go
+
+      - name: Unit tests on Windows
+        working-directory: core
+        run: go test -count=1 ./engine
+
+      - *build-desktop
+      - *package-desktop
+      - *upload
+
+  android:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      TARGET: android
+      RELEASE: ${{ needs.test.outputs.release }}
+      LIBXRAY_COMMIT: ${{ needs.test.outputs.libxray_commit }}
+      LIBXRAY_VERSION: ${{ needs.test.outputs.libxray_version }}
+      XRAY_MODULE_VERSION: ${{ needs.test.outputs.xray_module_version }}
+      XRAY_VERSION: ${{ needs.test.outputs.xray_version }}
+    steps:
+      - *checkout
+      - *setup-python
+      - *setup-go
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # gomobile compiles against the newest platform under ANDROID_HOME and the runner's SDK
+      # carries many, so the build gets a clean SDK holding only the pinned ones.
+      - name: Install the pinned Android platform and NDK
+        run: |
+          SDK="$RUNNER_TEMP/android-sdk"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          { yes || true; } | "$SDKMANAGER" --sdk_root="$SDK" --licenses > /dev/null
+          "$SDKMANAGER" --sdk_root="$SDK" --install "platforms;$ANDROID_PLATFORM" "ndk;$NDK_REVISION" > /dev/null
+          NDK="$SDK/ndk/$NDK_REVISION"
+          grep -q "^Pkg.Revision = $NDK_REVISION$" "$NDK/source.properties" || { cat "$NDK/source.properties"; echo "::error::NDK is not $NDK_REVISION"; exit 1; }
+          {
+            echo "ANDROID_HOME=$SDK"
+            echo "ANDROID_SDK_ROOT=$SDK"
+            echo "ANDROID_NDK_HOME=$NDK"
+          } >> "$GITHUB_ENV"
+
+      # As libXray's android build: API 21, 16 KB pages, and -checklinkname=0 for anet's
+      # linkname into the net package. Unlike it, stripped (-s -w) and trimmed.
+      - name: Build
+        working-directory: core
+        run: |
+          go install "golang.org/x/mobile/cmd/gomobile@$GOMOBILE_VERSION" "golang.org/x/mobile/cmd/gobind@$GOMOBILE_VERSION"
+          [ "$(go list -m -f '{{.Version}}' golang.org/x/mobile)" = "$GOMOBILE_VERSION" ] || { echo "::error::go.mod's x/mobile is not $GOMOBILE_VERSION"; exit 1; }
+          FLAGS="-s -w -buildid= -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384 -X github.com/bodovpn/releases/core/engine.release=$RELEASE"
+          echo "FLAGS=-target android -androidapi 21 -javapkg com.bodovpn -trimpath -ldflags=$FLAGS" >> "$GITHUB_ENV"
+          mkdir -p ../out
+          gomobile bind -target android -androidapi 21 -javapkg com.bodovpn -trimpath -ldflags="$FLAGS" \
+            -o ../out/BodoCore.aar ./bodocore
+
+      - name: Check and package
+        run: |
+          S="stage/bodocore-$TARGET"
+          mkdir -p "$S"
+          cp out/BodoCore.aar out/BodoCore-sources.jar "$S/"
+          python .github/scripts/bodocore.py licenses --src core "$S"
+          python .github/scripts/bodocore.py aar "$S/BodoCore.aar" --out contents.json
+          python .github/scripts/bodocore.py info --target "$TARGET" --contents contents.json --flags "$FLAGS" \
+            --tool "gomobile=$GOMOBILE_VERSION" \
+            --tool "ndk=$NDK_VERSION ($(sed -n 's/^Pkg.Revision = //p' "$ANDROID_NDK_HOME/source.properties"))" \
+            --tool "androidPlatform=$(ls "$ANDROID_HOME/platforms")" \
+            --tool "javac=$(javac -version 2>&1)" --out "stage/bodocore-$TARGET.json"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" python .github/scripts/bodocore.py zip "$S" "stage/bodocore-$TARGET.zip"
+
+      - *upload
+
+  # c-archive xcframework (iOS, iOS simulator, macOS), libXray's "go" layout with the header
+  # and module map in Headers/BodoCore/, run from a SwiftPM package before it ships.
+  apple:
+    needs: test
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      TARGET: apple
+      RELEASE: ${{ needs.test.outputs.release }}
+      LIBXRAY_COMMIT: ${{ needs.test.outputs.libxray_commit }}
+      LIBXRAY_VERSION: ${{ needs.test.outputs.libxray_version }}
+      XRAY_MODULE_VERSION: ${{ needs.test.outputs.xray_module_version }}
+      XRAY_VERSION: ${{ needs.test.outputs.xray_version }}
+    steps:
+      - name: Select the pinned Xcode
+        run: |
+          sudo xcode-select -s "/Applications/Xcode_$XCODE_VERSION.app/Contents/Developer"
+          xcodebuild -version | head -1 | grep -qx "Xcode $XCODE_VERSION" || { echo "::error::not Xcode $XCODE_VERSION"; exit 1; }
+
+      - *checkout
+      - *setup-python
+      - *setup-go
+
+      - name: Unit tests on macOS
+        working-directory: core
+        run: go test -count=1 ./engine
+
+      - name: Build
+        run: |
+          FLAGS="-s -w -buildid= -X github.com/bodovpn/releases/core/engine.release=$RELEASE"
+          echo "FLAGS=-trimpath -buildvcs=false -buildmode=c-archive -ldflags=$FLAGS (-tags ios on iOS)" >> "$GITHUB_ENV"
+          python .github/scripts/bodocore.py apple-build --src core --work "$RUNNER_TEMP/apple" \
+            --ldflags "$FLAGS" --output stage/bodocore-apple/BodoCore.xcframework
+
+      # The xcframework sits at the zip root, the layout a SwiftPM binaryTarget expects.
+      - name: Check, package and use the zip as a SwiftPM binaryTarget
+        run: |
+          S="stage/bodocore-$TARGET"
+          python .github/scripts/bodocore.py licenses --src core "$S"
+          python .github/scripts/bodocore.py xcframework "$S/BodoCore.xcframework" --out contents.json
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" python .github/scripts/bodocore.py zip --flat "$S" "stage/bodocore-$TARGET.zip"
+          python .github/scripts/bodocore.py swiftpm "stage/bodocore-$TARGET.zip" --platform 13.0 --out swiftpm.json \
+            --release "$RELEASE" --xray "$XRAY_VERSION" --libxray "$LIBXRAY_VERSION"
+          python .github/scripts/bodocore.py info --target "$TARGET" --contents contents.json --flags "$FLAGS" \
+            --merge swiftpm=swiftpm.json \
+            --tool "xcode=$(xcodebuild -version | paste -sd ' ' -)" \
+            --tool "cc=$(xcrun clang --version | head -1)" --out "stage/bodocore-$TARGET.json"
+
+      - *upload
+
+  publish:
+    needs: [test, linux-x64, windows-x64, android, apple]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      RELEASE: ${{ needs.test.outputs.release }}
+      LIBXRAY_TAG: ${{ needs.test.outputs.libxray_tag }}
+      LIBXRAY_VERSION: ${{ needs.test.outputs.libxray_version }}
+      LIBXRAY_COMMIT: ${{ needs.test.outputs.libxray_commit }}
+      XRAY_MODULE_VERSION: ${{ needs.test.outputs.xray_module_version }}
+      XRAY_VERSION: ${{ needs.test.outputs.xray_version }}
+      PUBLISH: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bodocore-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write manifest.json, SHA256SUMS and NOTES.md
+        run: |
+          python3 .github/scripts/bodocore.py manifest dist
+          cat dist/manifest.json
+
+      # Sigstore-signed SLSA provenance for every file in SHA256SUMS:
+      # gh attestation verify <file> -R BodoVPN/releases
+      - name: Attest build provenance
+        if: env.PUBLISH == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Keep the release files with the run
+        if: env.PUBLISH != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-preview
+          path: |
+            dist/manifest.json
+            dist/SHA256SUMS
+            dist/NOTES.md
+
+      - name: Create the pre-release
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="BodoVPN core $RELEASE (our Go module on libXray $LIBXRAY_TAG)"
+          if gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::$RELEASE already exists; dispatch the next build number"
+            exit 1
+          fi
+          gh release create "$RELEASE" dist/bodocore-*.zip dist/manifest.json dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --prerelease --latest=false --title "$TITLE" --notes-file dist/NOTES.md
+
+      - name: The app release is still the latest
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LATEST="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          echo "latest release: $LATEST"
+          case "$LATEST" in core-*) echo "::error::$LATEST became the latest release"; exit 1 ;; esac
