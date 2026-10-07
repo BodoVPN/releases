@@ -2,8 +2,10 @@ name: Build the BodoVPN core (our Go module on libXray)
 
 # Builds core/, our Go module, into ONE library per platform that holds libXray and our
 # additions (warm pingBatchWarm, in-process queryStats, Android protect): a process may load
-# only one Go runtime, so the apps load this instead of libXray's build. libXray's version is
-# pinned in core/go.mod. Like core.yml, every toolchain is pinned, every binary is checked
+# only one Go runtime, so the apps load this instead of libXray's build. Windows and Linux also
+# get `bodocore`, the desktop core run out of the app's process (cmd/bodocore: libXray's `run`
+# with counters on stdout, and `ping`). libXray's version is pinned in core/go.mod. Like
+# core.yml, every toolchain is pinned, every binary is checked
 # stripped and free of runner paths, every library is smoke-tested through its real entry
 # points, and the release files get SHA256SUMS, manifest.json and a provenance attestation.
 #
@@ -97,6 +99,7 @@ jobs:
     env:
       TARGET: linux-x64
       LIB: libBodoCore.so
+      EXE: bodocore
       CGO_ENABLED: "1"
       RELEASE: ${{ needs.test.outputs.release }}
       LIBXRAY_COMMIT: ${{ needs.test.outputs.libxray_commit }}
@@ -113,17 +116,19 @@ jobs:
         working-directory: core
         run: |
           FLAGS="-s -w -buildid= -X github.com/bodovpn/releases/core/engine.release=$RELEASE"
-          echo "FLAGS=-trimpath -buildvcs=false -buildmode=c-shared -ldflags=$FLAGS" >> "$GITHUB_ENV"
+          echo "FLAGS=-trimpath -buildvcs=false -ldflags=$FLAGS; library -buildmode=c-shared, executable CGO_ENABLED=0" >> "$GITHUB_ENV"
           go build -trimpath -buildvcs=false -buildmode=c-shared -ldflags "$FLAGS" -o "../out/$LIB" ./cbridge
+          # The desktop core, static like libXray's desktop `xray`: no libc to match on the user's box.
+          CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "$FLAGS" -o "../out/$EXE" ./cmd/bodocore
 
       - &package-desktop
         name: Smoke-test and package
         run: |
           S="stage/bodocore-$TARGET"
           mkdir -p "$S"
-          cp "out/$LIB" out/libBodoCore.h "$S/"
+          cp "out/$LIB" "out/$EXE" out/libBodoCore.h "$S/"
           python .github/scripts/bodocore.py licenses --src core "$S"
-          python .github/scripts/bodocore.py desktop "$S" --lib "$LIB" --machine x86_64 --out contents.json \
+          python .github/scripts/bodocore.py desktop "$S" --lib "$LIB" --exe "$EXE" --machine x86_64 --out contents.json \
             --release "$RELEASE" --xray "$XRAY_VERSION" --libxray "$LIBXRAY_VERSION"
           python .github/scripts/bodocore.py info --target "$TARGET" --contents contents.json --flags "$FLAGS" \
             --tool "cc=$(gcc --version | head -1)" --out "stage/bodocore-$TARGET.json"
@@ -148,6 +153,7 @@ jobs:
     env:
       TARGET: windows-x64
       LIB: libBodoCore.dll
+      EXE: bodocore.exe
       CGO_ENABLED: "1"
       GOARCH: amd64
       CC: gcc.exe

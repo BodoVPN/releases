@@ -298,22 +298,134 @@ def header_check(header):
         fail(f"{header.name} does not declare {', '.join(missing)}")
 
 
+def checked_binary(path, machine):
+    if not path.is_file() or path.stat().st_size == 0:
+        fail(f"missing {path}")
+    info = core.binary_machine(path)
+    if info["machine"] != machine:
+        fail(f"{path.name} is {info['machine']}, expected {machine}")
+    if info.get("stripped") is False:
+        fail(f"{path.name} keeps {', '.join(info['debugSections'])}: it was built without -s -w")
+    info["moduleReplacePaths"] = core.check_build_paths(path.name, path.read_bytes())
+    return info
+
+
 def cmd_desktop(args):
     root = Path(args.dir)
-    lib, header = root / args.lib, root / "libBodoCore.h"
-    for path in (lib, header):
-        if not path.is_file() or path.stat().st_size == 0:
-            fail(f"missing {path}")
+    lib, exe, header = root / args.lib, root / args.exe, root / "libBodoCore.h"
+    if not header.is_file():
+        fail(f"missing {header}")
     header_check(header)
-    info = core.binary_machine(lib)
-    if info["machine"] != args.machine:
-        fail(f"{lib.name} is {info['machine']}, expected {args.machine}")
-    if info.get("stripped") is False:
-        fail(f"{lib.name} keeps {', '.join(info['debugSections'])}: it was built without -s -w")
-    info["moduleReplacePaths"] = core.check_build_paths(lib.name, lib.read_bytes())
+    binaries = {args.lib: checked_binary(lib, args.machine), args.exe: checked_binary(exe, args.machine)}
     exported = core.exports(lib, EXPORTS)
     smoke = ctypes_smoke(lib, expected(args))
-    write_json(args.out, {"binaries": {args.lib: info}, "libraryExports": exported, "smoke": smoke})
+    exe_smoke = executable_smoke(exe)
+    write_json(args.out, {"binaries": binaries, "libraryExports": exported, "smoke": smoke, "executable": exe_smoke})
+
+
+def uplink_interface():
+    """The default route's interface name, as Go's net.InterfaceByName reads it."""
+    if os.name == "nt":
+        name = run(["powershell", "-NoProfile", "-Command",
+                    "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | "
+                    "Select-Object -First 1).InterfaceAlias"])
+    else:
+        match = re.search(r"\bdev (\S+)", run(["ip", "route", "get", "8.8.8.8"]))
+        name = match.group(1) if match else ""
+    if not name:
+        fail("found no uplink interface for -interface")
+    return name
+
+
+def read_lines(process, prefix, until, timeout):
+    """Lines from process's stdout that start with prefix, parsed, until until(rows) or timeout."""
+    rows, deadline = [], time.monotonic() + timeout
+    found = queue_lines(process)
+    while time.monotonic() < deadline and not until(rows):
+        try:
+            line = found.get(timeout=0.5)
+        except Exception:  # queue.Empty
+            if process.poll() is not None and found.empty():
+                break
+            continue
+        if line is None:
+            break
+        if line.startswith(prefix):
+            rows.append(json.loads(line[len(prefix):]))
+    return rows
+
+
+def queue_lines(process):
+    import queue
+
+    lines = queue.Queue()
+
+    def pump():
+        for line in process.stdout:
+            lines.put(line.rstrip("\r\n"))
+        lines.put(None)
+
+    threading.Thread(target=pump, daemon=True).start()
+    return lines
+
+
+def executable_smoke(exe):
+    """bodocore through its command line: usage, refusal, a streamed warm ping, and run's counters."""
+    binary = str(exe.resolve())
+    usage = subprocess.run([binary, "-h"], capture_output=True, text=True, timeout=30)
+    if usage.returncode != 0 or not usage.stdout.startswith("Usage: bodocore run") or "bodocore ping" not in usage.stdout:
+        fail(f"{exe.name} -h: exit {usage.returncode}, {usage.stdout!r}")
+    if subprocess.run([binary], capture_output=True, timeout=30).returncode == 0:
+        fail(f"{exe.name} without arguments exited 0")
+    iface = uplink_interface()
+    bind = ["-dns", "8.8.8.8:53", "-interface", iface]
+    record = {"usage": usage.stdout.splitlines()[0], "interface": iface}
+
+    with site() as server:
+        process = subprocess.Popen([binary, "ping", *bind], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+        process.stdin.write(ping_payload(server.url()))
+        process.stdin.close()
+        rows = read_lines(process, "bodocore-ping ", lambda r: len(r) >= 2, 30)
+        code, stderr = process.wait(timeout=30), process.stderr.read()
+        seen = (server.connections, server.requests)
+    by_index = {row["index"]: row for row in rows}
+    good, bad = by_index.get(0, {}), by_index.get(1, {})
+    if code != 0 or not (good.get("success") and good.get("warm")) or bad.get("success", True) or seen != (1, 2):
+        fail(f"{exe.name} ping: exit {code}, rows {rows}, site {seen}, stderr {stderr!r}")
+    record["ping"] = {"rows": rows, "siteConnections": seen[0], "siteRequests": seen[1]}
+
+    with site() as server:
+        port = free_port()
+        work = Path(os.environ.get("RUNNER_TEMP", ".")) / "bodocore-run"
+        work.mkdir(exist_ok=True)
+        config = work / "session.json"
+        config.write_text(stats_config(port, server.server_address[1]), encoding="utf-8")
+        process = subprocess.Popen([binary, "run", *bind, "-config", str(config), "-stats-interval", "200ms"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            for _ in range(50):
+                with contextlib.suppress(OSError), socket.create_connection(("127.0.0.1", port), timeout=1):
+                    break
+                time.sleep(0.1)
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            connection.request("GET", "/through-the-core", headers={"Connection": "close"})
+            status = connection.getresponse().status
+            connection.close()
+
+            def counted(rows):
+                proxy = rows[-1].get("outbound", {}).get("proxy", {}) if rows else {}
+                return proxy.get("uplink", 0) > 0 and proxy.get("downlink", 0) > 0
+
+            stats = read_lines(process, "bodocore-stats ", counted, 15)
+        finally:
+            process.terminate()
+            process.wait(timeout=30)
+    if status != 204 or not stats or not counted(stats):
+        fail(f"{exe.name} run: GET {status}, stats lines {stats[-3:]}, stderr {process.stderr.read()!r}")
+    record["run"] = {"statsLines": len(stats), "proxy": stats[-1]["outbound"]["proxy"]}
+    print(f"{exe.name}: {json.dumps(record)}")
+    return record
 
 
 def cmd_aar(args):
@@ -511,7 +623,8 @@ def describe(asset):
     if "slices" in contents:
         slices = ", ".join(s["identifier"] for s in contents["slices"])
         return f"`BodoCore.xcframework` (static): {slices}. SwiftPM `binaryTarget` checksum `{asset['swiftpmChecksum']}`"
-    return f"`{next(iter(contents['binaries']))}` + `libBodoCore.h`"
+    names = list(contents["binaries"])
+    return f"`{names[0]}` + `libBodoCore.h`, and the desktop core `{names[1]}` (`run` with counters on stdout, `ping`)"
 
 
 def cmd_manifest(args):
@@ -566,6 +679,11 @@ def cmd_manifest(args):
             "one path left is gomobile's module replace in the Go build info (moduleReplacePaths).",
             "Every library is smoke-tested through its real entry points before release: ctypes on Linux and "
             "Windows, a SwiftPM executable on macOS (contents.smoke).",
+            "The Windows and Linux zips also hold bodocore, the desktop core an app runs out of its own process: "
+            "`bodocore run -dns -interface -config [-error-file] [-stats-interval]` (libXray's desktop `xray run`, plus "
+            "`bodocore-stats <counters JSON>` lines on stdout) and `bodocore ping -dns -interface` (a PingRequest on "
+            "stdin, one `bodocore-ping <row JSON>` line per row). Smoke-tested from its command line "
+            "(contents.executable).",
             "The release files carry a Sigstore build-provenance attestation: "
             "gh attestation verify <file> -R BodoVPN/releases.",
         ],
@@ -615,6 +733,7 @@ def main():
     p = sub.add_parser("desktop")
     p.add_argument("dir")
     p.add_argument("--lib", required=True)
+    p.add_argument("--exe", required=True)
     p.add_argument("--machine", required=True)
     p.add_argument("--out", required=True)
     add_expect(p)
