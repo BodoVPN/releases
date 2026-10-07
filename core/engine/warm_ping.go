@@ -82,15 +82,20 @@ func PingBatchWarmJSON(payload string, onResult func(int, PingResult)) string {
 	return encode(PingResponse{Results: results}, nil)
 }
 
+// batches runs one batch at a time: two would share the bodo-ping- tags.
+var batches sync.Mutex
+
 // PingBatchWarm times every config warm through one temporary core, concurrently. The core
-// has no inbound, log or env, so it never listens and leaves a running tunnel core alone.
-// A bad config fails only its own row; when Xray refuses the merged core, each config gets
-// a core of its own. onResult, when set, is called once per row as it lands, one at a time.
+// has no inbound, log or env, so it never listens, and a running tunnel core keeps its own
+// log and lookups. A bad config fails only its own row; when Xray refuses the merged core,
+// each config gets a core of its own. onResult, when set, gets each row once, one at a time.
 func PingBatchWarm(ctx context.Context, request PingRequest, onResult func(int, PingResult)) ([]PingResult, error) {
 	timeout, workers, err := request.validate()
 	if err != nil {
 		return nil, err
 	}
+	batches.Lock()
+	defer batches.Unlock()
 	rows := &rowReporter{results: make([]PingResult, len(request.Configs)), onResult: onResult}
 	var items []pingItem
 	for index, config := range request.Configs {
@@ -104,18 +109,41 @@ func PingBatchWarm(ctx context.Context, request PingRequest, onResult func(int, 
 	if len(items) == 0 {
 		return rows.results, nil
 	}
+	probe := func(server *core.Instance) func(pingItem) PingResult {
+		return func(item pingItem) PingResult { return probeWarm(ctx, server, item.tag, request.URL, timeout) }
+	}
 	server, err := startPingCore(items)
-	if err != nil {
-		forEachItem(items, workers, rows, func(item pingItem) PingResult {
-			return probeAlone(ctx, item, request.URL, timeout)
-		})
+	if err == nil {
+		defer func() { _ = closeCore(server) }()
+		forEachItem(items, workers, rows, probe(server))
 		return rows.results, nil
 	}
-	defer server.Close()
-	forEachItem(items, workers, rows, func(item pingItem) PingResult {
-		return probeWarm(ctx, server, item.tag, request.URL, timeout)
-	})
+	for start := 0; start < len(items); start += workers {
+		probeEachAlone(items[start:min(start+workers, len(items))], workers, rows, probe)
+	}
 	return rows.results, nil
+}
+
+// probeEachAlone gives each item a core of its own, all started before any is probed: a
+// core.New during a probe would rewrite the dialer globals under it.
+func probeEachAlone(items []pingItem, workers int, rows *rowReporter, probe func(*core.Instance) func(pingItem) PingResult) {
+	servers := map[int]*core.Instance{}
+	defer func() {
+		for _, server := range servers {
+			_ = closeCore(server)
+		}
+	}()
+	var started []pingItem
+	for _, item := range items {
+		server, err := startPingCore([]pingItem{item})
+		if err != nil {
+			rows.report(item.index, failedPing("core", err))
+			continue
+		}
+		servers[item.index] = server
+		started = append(started, item)
+	}
+	forEachItem(started, workers, rows, func(item pingItem) PingResult { return probe(servers[item.index])(item) })
 }
 
 func (r PingRequest) validate() (time.Duration, int, error) {
@@ -144,16 +172,6 @@ func (r PingRequest) validate() (time.Duration, int, error) {
 		return 0, 0, fmt.Errorf("pingBatchWarm concurrency must be 1-%d", maxPingConcurrency)
 	}
 	return time.Duration(timeoutMs) * time.Millisecond, workers, nil
-}
-
-// probeAlone times one config through a core of its own, for when the merged core failed.
-func probeAlone(ctx context.Context, item pingItem, target string, timeout time.Duration) PingResult {
-	server, err := startPingCore([]pingItem{item})
-	if err != nil {
-		return failedPing("core", err)
-	}
-	defer server.Close()
-	return probeWarm(ctx, server, item.tag, target, timeout)
 }
 
 type rowReporter struct {
@@ -201,19 +219,18 @@ func guardedProbe(item pingItem, probe func(pingItem) PingResult) (result PingRe
 	return probe(item)
 }
 
-// startPingCore is a variable so a test can make Xray refuse the merged core.
+// startPingCore is a variable so a test can make Xray refuse the merged core. Close what it
+// returns with closeCore.
 var startPingCore = func(items []pingItem) (*core.Instance, error) {
 	config, err := buildPingCoreConfig(items)
 	if err != nil {
 		return nil, err
 	}
-	server, err := core.New(config)
-	if err != nil {
-		return nil, err
+	hosts := map[string]bool{}
+	for _, item := range items {
+		for _, host := range item.hosts {
+			hosts[host] = true
+		}
 	}
-	if err := server.Start(); err != nil {
-		_ = server.Close()
-		return nil, err
-	}
-	return server, nil
+	return startCore(config, hosts)
 }

@@ -2,7 +2,6 @@ package engine
 
 import (
 	"errors"
-	"fmt"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -44,12 +43,8 @@ func (s *tunnelCore) run(xrayJSON string) error {
 	if err != nil {
 		return err
 	}
-	server, err := core.New(config)
+	server, err := startCore(config, nil)
 	if err != nil {
-		return err
-	}
-	if err := server.Start(); err != nil {
-		_ = server.Close()
 		return err
 	}
 	s.server = server
@@ -63,7 +58,7 @@ func (s *tunnelCore) stop() error {
 	if s.server == nil {
 		return nil
 	}
-	err := s.server.Close()
+	err := closeCore(s.server)
 	s.server = nil
 	return err
 }
@@ -108,15 +103,4 @@ func (s *tunnelCore) counters() (Counters, error) {
 		return nil, ErrNoCounters
 	}
 	return counters, nil
-}
-
-// whileStopped runs a libXray method that builds its own core, which would replace the
-// process's log handler under the tunnel's core, so it refuses while one runs (as libXray does).
-func (s *tunnelCore) whileStopped(method string, call func() string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.server != nil {
-		return encode(nil, fmt.Errorf("%s requires a process without a running tunnel core", method))
-	}
-	return call()
 }

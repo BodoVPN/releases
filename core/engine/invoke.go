@@ -18,7 +18,8 @@ const (
 	MethodBuildInfo     = "buildInfo"
 )
 
-// libXray methods that build a core of their own; they wait for the tunnel's core to stop.
+// libXray methods that build a core of their own, with a log app that would become the
+// process's log handler; like libXray, they refuse while another core runs.
 const (
 	libXrayTestXray  = "testXray"
 	libXrayPingBatch = "pingBatch"
@@ -81,7 +82,7 @@ func Invoke(requestJSON string) string {
 	case MethodBuildInfo:
 		return encode(ReadBuildInfo(), nil)
 	case libXrayTestXray, libXrayPingBatch:
-		return tunnel.whileStopped(request.Method, func() string { return libXray.Invoke(requestJSON) })
+		return withoutLiveCores(request.Method, func() string { return libXray.Invoke(requestJSON) })
 	default:
 		return libXray.Invoke(requestJSON)
 	}

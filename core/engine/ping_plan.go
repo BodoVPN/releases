@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/xtls/xray-core/infra/conf"
@@ -20,6 +21,7 @@ type pingItem struct {
 	index     int
 	tag       string
 	outbounds []map[string]any
+	hosts     []string
 	support   []map[string]any
 	dns       map[string]any
 	routing   map[string]any
@@ -62,6 +64,7 @@ func planPingItem(index int, config PingConfig) (pingItem, error) {
 			return pingItem{}, fmt.Errorf("outbound %q: %w", tagOf(outbounds[at]), err)
 		}
 		item.outbounds = append(item.outbounds, outbound)
+		item.hosts = append(item.hosts, serverDomains(outbound)...)
 	}
 	for at, outbound := range outbounds {
 		tag := tagOf(outbound)
@@ -207,6 +210,56 @@ func outboundRefs(outbound map[string]any) []outboundRef {
 		return []outboundRef{{tag, func(name string) { sockopt["dialerProxy"] = name }}}
 	}
 	return nil
+}
+
+// serverDomains are the domain names an outbound dials (its servers, peers and xhttp's
+// download server), lower case; IP literals need no lookup.
+func serverDomains(outbound map[string]any) []string {
+	var addresses []string
+	settings, _ := outbound["settings"].(map[string]any)
+	if address, ok := settings["address"].(string); ok {
+		addresses = append(addresses, address)
+	}
+	for _, key := range []string{"vnext", "servers"} {
+		list, _ := settings[key].([]any)
+		for _, entry := range list {
+			if server, ok := entry.(map[string]any); ok {
+				if address, ok := server["address"].(string); ok {
+					addresses = append(addresses, address)
+				}
+			}
+		}
+	}
+	peers, _ := settings["peers"].([]any)
+	for _, entry := range peers {
+		if peer, ok := entry.(map[string]any); ok {
+			if endpoint, ok := peer["endpoint"].(string); ok {
+				host, _, err := net.SplitHostPort(endpoint)
+				if err != nil {
+					host = endpoint
+				}
+				addresses = append(addresses, host)
+			}
+		}
+	}
+	stream, _ := outbound["streamSettings"].(map[string]any)
+	for _, key := range []string{"xhttpSettings", "splithttpSettings"} {
+		xhttp, _ := stream[key].(map[string]any)
+		extra, _ := xhttp["extra"].(map[string]any)
+		for _, holder := range []map[string]any{xhttp, extra} {
+			download, _ := holder["downloadSettings"].(map[string]any)
+			if address, ok := download["address"].(string); ok {
+				addresses = append(addresses, address)
+			}
+		}
+	}
+	var domains []string
+	for _, address := range addresses {
+		if address != "" && net.ParseIP(strings.Trim(address, "[]")) == nil {
+			domains = append(domains, strings.ToLower(address))
+		}
+	}
+	return domains
 }
 
 func validateOutbound(outbound map[string]any) error {

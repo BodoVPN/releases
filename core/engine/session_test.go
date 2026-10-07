@@ -80,7 +80,7 @@ func TestLibXrayCoreBuildersWaitForTheTunnelCore(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := invokeFor(t, libXrayTestXray, map[string]any{"xrayJson": freedomConfig(t)})
-	if response.Success || !strings.Contains(response.Error, "without a running tunnel core") {
+	if response.Success || !strings.Contains(response.Error, "without a running core") {
 		t.Fatalf("testXray beside the tunnel core = %+v, want a refusal", response)
 	}
 	if err := tunnel.stop(); err != nil {

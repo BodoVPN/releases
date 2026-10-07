@@ -28,6 +28,8 @@ type target struct {
 	peak        atomic.Int64
 	delay       time.Duration
 	hang        chan struct{}
+	// onRequest runs inside the handler with the request's number, from 1.
+	onRequest func(int64)
 }
 
 func newTarget(t *testing.T, configure func(*target)) *target {
@@ -53,7 +55,10 @@ func newTarget(t *testing.T, configure func(*target)) *target {
 }
 
 func (s *target) serve(w http.ResponseWriter, _ *http.Request) {
-	s.requests.Add(1)
+	number := s.requests.Add(1)
+	if s.onRequest != nil {
+		s.onRequest(number)
+	}
 	now := s.inFlight.Add(1)
 	defer s.inFlight.Add(-1)
 	for {
@@ -172,7 +177,13 @@ func vlessClientConfig(t *testing.T, port int, id string) string {
 // getThrough fetches url through the running tunnel core's outbound tag.
 func getThrough(t *testing.T, server *core.Instance, tag, url string) {
 	t.Helper()
-	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+	if err := fetchThrough(server, tag, url); err != nil {
+		t.Fatalf("GET through %s: %v", tag, err)
+	}
+}
+
+func fetchThrough(server *core.Instance, tag, url string) error {
+	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
 			destination, err := xnet.ParseDestination("tcp:" + address)
 			if err != nil {
@@ -180,13 +191,15 @@ func getThrough(t *testing.T, server *core.Instance, tag, url string) {
 			}
 			return core.Dial(session.SetForcedOutboundTagToContext(ctx, tag), server, destination)
 		},
-	}}
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Timeout: 5 * time.Second, Transport: transport}
 	response, err := client.Get(url)
 	if err != nil {
-		t.Fatalf("GET through %s: %v", tag, err)
+		return err
 	}
 	_, _ = io.Copy(io.Discard, response.Body)
-	_ = response.Body.Close()
+	return response.Body.Close()
 }
 
 func invokeFor(t *testing.T, method string, payload any) invokeResponse {
