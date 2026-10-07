@@ -21,6 +21,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -230,15 +231,22 @@ class Smoke:
             ok_data(self.call(request("runXray", {"xrayJson": config})), f"{self.label} runXray")
             try:
                 connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-                connection.request("GET", "/through-the-core")
+                # Linux splices raw TCP to raw TCP and counts the spliced bytes when the
+                # connection ends, so this one ends right after the reply.
+                connection.request("GET", "/through-the-core", headers={"Connection": "close"})
                 status = connection.getresponse().status
                 connection.close()
-                counters = ok_data(self.call(request("queryStats")), f"{self.label} queryStats")
+                counters, proxy = {}, {}
+                for _ in range(50):
+                    counters = ok_data(self.call(request("queryStats")), f"{self.label} queryStats")
+                    proxy = counters.get("outbound", {}).get("proxy", {})
+                    if proxy.get("uplink", 0) > 0 and proxy.get("downlink", 0) > 0:
+                        break
+                    time.sleep(0.1)
             finally:
                 ok_data(self.call(request("stopXray")), f"{self.label} stopXray")
-        proxy = counters.get("outbound", {}).get("proxy", {})
         if status != 204 or proxy.get("uplink", 0) <= 0 or proxy.get("downlink", 0) <= 0:
-            fail(f"{self.label}: GET through the core gave {status}; counters {counters}")
+            fail(f"{self.label}: GET through the core gave {status}; counters after 5 s {counters}")
         if ok_data(self.call(request("getXrayState")), f"{self.label} getXrayState")["running"]:
             fail(f"{self.label}: a core still runs after stopXray")
         self.record["queryStats"] = proxy

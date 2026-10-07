@@ -211,7 +211,7 @@ jobs:
       - name: Build
         working-directory: core
         run: |
-          go install "golang.org/x/mobile/cmd/gomobile@$GOMOBILE_VERSION"
+          go install "golang.org/x/mobile/cmd/gomobile@$GOMOBILE_VERSION" "golang.org/x/mobile/cmd/gobind@$GOMOBILE_VERSION"
           [ "$(go list -m -f '{{.Version}}' golang.org/x/mobile)" = "$GOMOBILE_VERSION" ] || { echo "::error::go.mod's x/mobile is not $GOMOBILE_VERSION"; exit 1; }
           FLAGS="-s -w -buildid= -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384 -X github.com/bodovpn/releases/core/engine.release=$RELEASE"
           echo "FLAGS=-target android -androidapi 21 -javapkg com.bodovpn -trimpath -ldflags=$FLAGS" >> "$GITHUB_ENV"
