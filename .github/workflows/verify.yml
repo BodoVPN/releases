@@ -211,3 +211,49 @@ jobs:
             echo "::error::Swift lint failed. The log stays private in this public repo: run make lint-swift locally."
             exit 1
           fi
+
+  # The iOS app, its XrayTunnel extension and the engine plugin compile, unsigned. Nothing else here
+  # builds the iOS target (swift test runs on macOS), which let an iOS 16-only API into the iOS 15
+  # core (client #207). The core's xcframework comes from its pinned release; output stays private.
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      - name: Resolve Flutter version from .fvmrc
+        id: fvm
+        run: echo "version=$(jq -r .flutter .fvmrc)" >> "$GITHUB_OUTPUT"
+
+      - name: Select Xcode 26
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$XCODE" ]; then
+            echo "::error::No Xcode 26 on this runner image. Installed:"; ls -d /Applications/Xcode*.app; exit 1
+          fi
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ steps.fvm.outputs.version }}
+          cache: true
+
+      - name: flutter build ios --no-codesign (output kept private)
+        run: |
+          echo "source commit: $(git rev-parse HEAD)"
+          log="$RUNNER_TEMP/build-ios.log"
+          if flutter pub get > "$log" 2>&1 \
+            && flutter build ios --debug --no-codesign --dart-define=FLAVOR=prod >> "$log" 2>&1; then
+            echo "iOS build passed"
+          else
+            echo "::error::The iOS build failed. The log stays private in this public repo: run flutter build ios --no-codesign locally."
+            exit 1
+          fi
