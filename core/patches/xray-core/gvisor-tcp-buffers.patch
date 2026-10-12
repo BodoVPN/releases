@@ -1,0 +1,20 @@
+diff --git a/proxy/tun/stack_gvisor.go b/proxy/tun/stack_gvisor.go
+--- a/proxy/tun/stack_gvisor.go
++++ b/proxy/tun/stack_gvisor.go
+@@ -24,12 +24,12 @@ const (
+ 	defaultNIC tcpip.NICID = 1
+ 
+ 	tcpRXBufMinSize = tcp.MinBufferSize
+-	tcpRXBufDefSize = tcp.DefaultSendBufferSize
+-	tcpRXBufMaxSize = 8 << 20 // 8MiB
++	tcpRXBufDefSize = 128 << 10 // 128KiB
++	tcpRXBufMaxSize = 256 << 10 // 256KiB
+ 
+ 	tcpTXBufMinSize = tcp.MinBufferSize
+-	tcpTXBufDefSize = tcp.DefaultReceiveBufferSize
+-	tcpTXBufMaxSize = 6 << 20 // 6MiB
++	tcpTXBufDefSize = 128 << 10 // 128KiB
++	tcpTXBufMaxSize = 256 << 10 // 256KiB
+ )
+ 
+ // stackGVisor is ip stack implemented by gVisor package

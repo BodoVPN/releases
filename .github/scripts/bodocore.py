@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Helpers for bodocore.yml: resolve the pinned libXray, build the Apple xcframework, smoke-test
+"""Helpers for bodocore.yml: resolve the pinned libXray, patch Xray-core, build the Apple xcframework, smoke-test
 every library through its real C or Swift entry points, and write the release's manifest.json,
 SHA256SUMS and NOTES.md. Reuses core.py's binary checks.
 
@@ -86,6 +86,36 @@ def cmd_resolve(args):
     print(json.dumps(outputs, indent=2))
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
         out.writelines(f"{key}={value}\n" for key, value in outputs.items())
+
+
+def cmd_patch_xray(args):
+    """Apply core/patches/xray-core/*.patch to the pinned Xray-core and point go.mod at the copy.
+
+    Copies the module cache's (read-only) Xray-core into --work, checks every patch applies
+    cleanly before applying any (an upstream bump that moved the lines fails here, loudly), then
+    `go mod edit -replace`s to the copy. go.mod is left edited for the rest of the job only.
+    """
+    src, work = Path(args.src).resolve(), Path(args.work).resolve()
+    patches = sorted((src / "patches" / "xray-core").glob("*.patch"))
+    if not patches:
+        fail(f"no patches in {src / 'patches' / 'xray-core'}")
+    _, xray = go_modules(src)
+    if xray.get("Replace"):
+        fail(f"{core.XRAY_CORE_MODULE} is already replaced by {xray['Replace']}")
+    pinned = run(["go", "mod", "download", "-json", f"{core.XRAY_CORE_MODULE}@{xray['Version']}"], cwd=src)
+    cache = Path(json.loads(pinned)["Dir"])
+    copy = work / "xray-core"
+    shutil.rmtree(copy, ignore_errors=True)
+    shutil.copytree(cache, copy)
+    for path in [copy, *copy.rglob("*")]:
+        path.chmod(path.stat().st_mode | 0o200)
+    for patch in patches:
+        if subprocess.run(["git", "apply", "--check", "-v", str(patch)], cwd=copy).returncode != 0:
+            fail(f"{patch.name} does not apply to {core.XRAY_CORE_MODULE} {xray['Version']}")
+    for patch in patches:
+        run(["git", "apply", str(patch)], cwd=copy)
+        print(f"applied {patch.name} to {core.XRAY_CORE_MODULE} {xray['Version']}")
+    run(["go", "mod", "edit", f"-replace={core.XRAY_CORE_MODULE}={copy}"], cwd=src)
 
 
 def cmd_licenses(args):
@@ -724,6 +754,11 @@ def main():
     p.add_argument("--src", required=True)
     p.add_argument("--build", default="")
     p.set_defaults(func=cmd_resolve)
+
+    p = sub.add_parser("patch-xray")
+    p.add_argument("--src", required=True)
+    p.add_argument("--work", required=True)
+    p.set_defaults(func=cmd_patch_xray)
 
     p = sub.add_parser("licenses")
     p.add_argument("dir")

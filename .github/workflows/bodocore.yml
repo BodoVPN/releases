@@ -82,6 +82,13 @@ jobs:
           [ -z "$unformatted" ] || { echo "::error::gofmt: $unformatted"; exit 1; }
           go vet ./...
 
+      # Xray-core patches (core/patches/xray-core): checked, then applied to a copy go.mod points
+      # at for the rest of the job. After the module check, which needs go.mod as committed.
+      - &patch-xray
+        name: Patch Xray-core
+        shell: bash
+        run: python .github/scripts/bodocore.py patch-xray --src core --work "$RUNNER_TEMP/patched"
+
       - name: Unit tests
         working-directory: core
         run: go test -race -count=1 ./...
@@ -110,6 +117,7 @@ jobs:
       - *checkout
       - *setup-python
       - *setup-go
+      - *patch-xray
 
       - &build-desktop
         name: Build
@@ -166,6 +174,7 @@ jobs:
       - *checkout
       - *setup-python
       - *setup-go
+      - *patch-xray
 
       - name: Unit tests on Windows
         working-directory: core
@@ -190,6 +199,7 @@ jobs:
       - *checkout
       - *setup-python
       - *setup-go
+      - *patch-xray
 
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
@@ -263,6 +273,7 @@ jobs:
       - *checkout
       - *setup-python
       - *setup-go
+      - *patch-xray
 
       - name: Unit tests on macOS
         working-directory: core

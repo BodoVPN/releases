@@ -47,3 +47,9 @@ func TestBuildInfoNamesTheCore(t *testing.T) {
 		t.Fatalf("buildInfo = %+v", info)
 	}
 }
+
+func TestFreeOSMemoryAnswersEmpty(t *testing.T) {
+	if response := invokeFor(t, MethodFreeOSMemory, nil); !response.Success {
+		t.Fatalf("freeOSMemory: %s", response.Error)
+	}
+}

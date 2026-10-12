@@ -1,0 +1,2 @@
+# Patch context lines start with a space by format; whitespace checks do not apply.
+*.patch -whitespace
