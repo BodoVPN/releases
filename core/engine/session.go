@@ -6,7 +6,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/xtls/libxray/memory"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/stats"
 	_ "github.com/xtls/xray-core/main/distro/all"
@@ -38,7 +37,7 @@ func (s *tunnelCore) run(xrayJSON string) error {
 	if s.server != nil {
 		return ErrAlreadyRunning
 	}
-	memory.InitForceFree()
+	initRuntime()
 	config, err := core.LoadConfig("json", strings.NewReader(xrayJSON))
 	if err != nil {
 		return err
@@ -60,6 +59,7 @@ func (s *tunnelCore) stop() error {
 	}
 	err := closeCore(s.server)
 	s.server = nil
+	afterStop()
 	return err
 }
 

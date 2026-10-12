@@ -1,0 +1,3 @@
+# Patch context lines start with a space by format, so whitespace checks do not apply, and a
+# patch must keep LF endings on every checkout (Windows) to match the LF source it patches.
+*.patch -whitespace text eol=lf

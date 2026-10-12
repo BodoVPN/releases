@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 
 	libXray "github.com/xtls/libxray"
 )
@@ -16,6 +17,10 @@ const (
 	MethodQueryStats    = "queryStats"
 	MethodPingBatchWarm = "pingBatchWarm"
 	MethodBuildInfo     = "buildInfo"
+	// MethodFreeOSMemory returns the Go runtime's freed pages to the system now, for a host
+	// under memory pressure (the iOS provider's guard). It stops the world, so it is not for
+	// the steady state.
+	MethodFreeOSMemory = "freeOSMemory"
 )
 
 // libXray methods that build a core of their own, with a log app that would become the
@@ -51,7 +56,7 @@ type statePayload struct {
 }
 
 // Invoke answers one request in libXray's JSON envelope (API version 3). It runs the tunnel's
-// core itself, so queryStats can read it, and adds pingBatchWarm and buildInfo.
+// core itself, so queryStats can read it, and adds pingBatchWarm, buildInfo and freeOSMemory.
 func Invoke(requestJSON string) string {
 	if len(requestJSON) > maxInvokeBytes {
 		return encode(nil, fmt.Errorf("invoke request exceeds the %d MiB size limit", maxInvokeBytes>>20))
@@ -81,6 +86,9 @@ func Invoke(requestJSON string) string {
 		return PingBatchWarmJSON(string(request.Payload), nil)
 	case MethodBuildInfo:
 		return encode(ReadBuildInfo(), nil)
+	case MethodFreeOSMemory:
+		debug.FreeOSMemory()
+		return encodeEmpty(nil)
 	case libXrayTestXray, libXrayPingBatch:
 		return withoutLiveCores(request.Method, func() string { return libXray.Invoke(requestJSON) })
 	default:
