@@ -16,9 +16,10 @@ carry more than 100 MB/s per connection. In a memory-capped process, an iOS Netw
 into the runtime's memory limit, where it collects back to back.
 
 Measured on an iPhone 15 Pro Max over a 15-minute workload, four cycles in one session
-(BodoVPN/bodovpn-client#195): with the large buffers the first cycle hit 266 GC/s and half the
-throughput; with this patch plus our iOS runtime policy (`engine/runtime_ios.go`), every cycle
-stayed in low mode at about 20% less CPU than the C packet bridge it replaced.
+(BodoVPN/bodovpn-client#195, comment 6133017236): with 2 MiB / 1 MiB buffers and a 36 MiB limit, the
+first cycle's download ran 266 GC/s at half the throughput; with this patch plus our iOS runtime
+policy (`engine/runtime_policy.go`), every cycle stayed in low mode at about 20% less CPU than the C
+packet bridge it replaced. (The 334 GC/s in an earlier #195 comment is libXray's original policy.)
 
 Android runs the same gVisor tun and gets the same sizes; Windows and Linux use tun2socks and do not
 load this code.
