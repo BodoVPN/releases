@@ -118,6 +118,49 @@ def cmd_patch_xray(args):
     run(["go", "mod", "edit", f"-replace={core.XRAY_CORE_MODULE}={copy}"], cwd=src)
 
 
+
+def cmd_patch_go(args):
+    """Apply core/patches/go/*.patch to this job's Go standard library through a build overlay.
+
+    Copies each file the patches touch from `go env GOROOT` into --work, checks every patch
+    applies cleanly before applying any (a Go bump that moved the lines fails here, loudly), then
+    writes an overlay that swaps the copies in and adds `-overlay` to GOFLAGS for the rest of the
+    job. The toolchain itself is never modified.
+    """
+    src, work = Path(args.src).resolve(), Path(args.work).resolve()
+    patches = sorted((src / "patches" / "go").glob("*.patch"))
+    if not patches:
+        fail(f"no patches in {src / 'patches' / 'go'}")
+    version = run(["go", "env", "GOVERSION"], cwd=src)
+    # As go reports it, not resolved: the overlay's keys must match the paths go compiles from.
+    goroot = Path(run(["go", "env", "GOROOT"], cwd=src))
+    if goroot.resolve().is_relative_to(Path(run(["go", "env", "GOMODCACHE"], cwd=src)).resolve()):
+        fail(f"{version} runs from the module cache ({goroot}), whose files an overlay may not replace; "
+             f"build with GOTOOLCHAIN=local and {version} installed outside it, as the workflow does")
+    touched = sorted({line[len("+++ b/"):].strip() for patch in patches
+                      for line in patch.read_text(encoding="utf-8").splitlines() if line.startswith("+++ b/")})
+    copy = work / "goroot"
+    shutil.rmtree(copy, ignore_errors=True)
+    for rel in touched:
+        if not (goroot / rel).is_file():
+            fail(f"{rel} is not in {version}'s GOROOT ({goroot})")
+        (copy / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(goroot / rel, copy / rel)
+    for patch in patches:
+        if subprocess.run(["git", "apply", "--check", "-v", str(patch)], cwd=copy).returncode != 0:
+            fail(f"{patch.name} does not apply to {version}")
+    for patch in patches:
+        run(["git", "apply", str(patch)], cwd=copy)
+        print(f"applied {patch.name} to {version}")
+    overlay = work / "go-overlay.json"
+    write_json(overlay, {"Replace": {str(goroot / rel): str(copy / rel) for rel in touched}})
+    flags = " ".join(filter(None, [os.environ.get("GOFLAGS", ""), f"-overlay={overlay}"]))
+    if "GITHUB_ENV" in os.environ:
+        with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
+            out.write(f"GOFLAGS={flags}\n")
+    print(f"GOFLAGS={flags}")
+
+
 def cmd_licenses(args):
     """libXray's MIT and Xray-core's MPL-2.0 licence, from the module cache, into a release dir."""
     libxray, xray = go_modules(args.src)
@@ -759,6 +802,11 @@ def main():
     p.add_argument("--src", required=True)
     p.add_argument("--work", required=True)
     p.set_defaults(func=cmd_patch_xray)
+
+    p = sub.add_parser("patch-go")
+    p.add_argument("--src", required=True)
+    p.add_argument("--work", required=True)
+    p.set_defaults(func=cmd_patch_go)
 
     p = sub.add_parser("licenses")
     p.add_argument("dir")
