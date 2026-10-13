@@ -20,8 +20,8 @@ XHTTP server builds its `http.Server` without an HTTP/2 config, so it advertises
 and every stream gets the full 512 KiB. In an iOS Network Extension (about 50 MB before jetsam) a
 burst of connections holds tens of MiB, and the runtime's memory limit makes the heap collect back to
 back. The patch caps the buffer at 32 KiB, `io.Copy`'s size. Xray hands the body at most one 8 KiB
-`buf.Buffer` per read (`buf.Size`; measured in XTLS/Xray-core#6268), so the larger buffer never carried
-more data.
+`buf.Buffer` per read (`buf.Size`; measured in XTLS/Xray-core#6268, comment 5140779704, with the
+frame-size tradeoff in golang/go#79831), so the larger buffer never carried more data.
 
 Measured on an iPhone 15 Pro Max (BodoVPN/bodovpn-client#143), VLESS + XHTTP stream-one + REALITY
 through a server whose uplink was held to 1 Mbit/s with 100 ms delay and 2% loss, two bursts of 60

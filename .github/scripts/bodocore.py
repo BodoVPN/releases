@@ -118,7 +118,6 @@ def cmd_patch_xray(args):
     run(["go", "mod", "edit", f"-replace={core.XRAY_CORE_MODULE}={copy}"], cwd=src)
 
 
-
 def cmd_patch_go(args):
     """Apply core/patches/go/*.patch to this job's Go standard library through a build overlay.
 
