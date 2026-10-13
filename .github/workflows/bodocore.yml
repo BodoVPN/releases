@@ -89,6 +89,13 @@ jobs:
         shell: bash
         run: python .github/scripts/bodocore.py patch-xray --src core --work "$RUNNER_TEMP/patched"
 
+      # Go standard library patches (core/patches/go): checked, then swapped in through a build
+      # overlay (GOFLAGS) for the rest of the job. setup-go's toolchain is never modified.
+      - &patch-go
+        name: Patch Go
+        shell: bash
+        run: python .github/scripts/bodocore.py patch-go --src core --work "$RUNNER_TEMP/go-patched"
+
       - name: Unit tests
         working-directory: core
         run: go test -race -count=1 ./...
@@ -118,6 +125,7 @@ jobs:
       - *setup-python
       - *setup-go
       - *patch-xray
+      - *patch-go
 
       - &build-desktop
         name: Build
@@ -175,6 +183,7 @@ jobs:
       - *setup-python
       - *setup-go
       - *patch-xray
+      - *patch-go
 
       - name: Unit tests on Windows
         working-directory: core
@@ -200,6 +209,7 @@ jobs:
       - *setup-python
       - *setup-go
       - *patch-xray
+      - *patch-go
 
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
@@ -274,6 +284,7 @@ jobs:
       - *setup-python
       - *setup-go
       - *patch-xray
+      - *patch-go
 
       - name: Unit tests on macOS
         working-directory: core

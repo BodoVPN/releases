@@ -1,0 +1,22 @@
+diff --git a/src/net/http/internal/http2/transport.go b/src/net/http/internal/http2/transport.go
+index 0b32ea7..bb2811c 100644
+--- a/src/net/http/internal/http2/transport.go
++++ b/src/net/http/internal/http2/transport.go
+@@ -1605,7 +1605,7 @@ var (
+ // It returns max(1, min(peer's advertised max frame size,
+ // Request.ContentLength+1, 512KB)).
+ func (cs *clientStream) frameScratchBufferLen(maxFrameSize int) int {
+-	const max = 512 << 10
++	const max = 32 << 10 // BodoVPN #143: was 512 KiB (core/patches/go/README.md)
+ 	n := min(int64(maxFrameSize), max)
+ 	if cl := cs.reqBodyContentLength; cl != -1 && cl+1 < n {
+ 		// Add an extra byte past the declared content-length to
+@@ -1617,7 +1617,7 @@ func (cs *clientStream) frameScratchBufferLen(maxFrameSize int) int {
+ 	if n < 1 {
+ 		return 1
+ 	}
+-	return int(n) // doesn't truncate; max is 512K
++	return int(n) // doesn't truncate; max is 32K
+ }
+ 
+ // Seven bufPools manage different frame sizes. This helps to avoid scenarios where long-running
