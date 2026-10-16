@@ -89,6 +89,12 @@ jobs:
         shell: bash
         run: python .github/scripts/bodocore.py patch-xray --src core --work "$RUNNER_TEMP/patched"
 
+      # quic-go patches (core/patches/quic-go), the same way, for Xray's Hysteria transport.
+      - &patch-quic
+        name: Patch quic-go
+        shell: bash
+        run: python .github/scripts/bodocore.py patch-quic --src core --work "$RUNNER_TEMP/patched"
+
       # Go standard library patches (core/patches/go): checked, then swapped in through a build
       # overlay (GOFLAGS) for the rest of the job. setup-go's toolchain is never modified.
       - &patch-go
@@ -99,6 +105,11 @@ jobs:
       - name: Unit tests
         working-directory: core
         run: go test -race -count=1 ./...
+
+      # The quic-go patch's own tests, in the patched copy.
+      - name: quic-go patch tests
+        working-directory: ${{ runner.temp }}/patched/quic-go
+        run: go test -race -count=1 -run 'StreamWindow|StreamFlowControl|ReceiveStream' .
 
       # The Go patches' own tests, which the overlay swaps in beside the patched files.
       - name: Go patch tests
@@ -130,6 +141,7 @@ jobs:
       - *setup-python
       - *setup-go
       - *patch-xray
+      - *patch-quic
       - *patch-go
 
       - &build-desktop
@@ -188,6 +200,7 @@ jobs:
       - *setup-python
       - *setup-go
       - *patch-xray
+      - *patch-quic
       - *patch-go
 
       - name: Unit tests on Windows
@@ -214,6 +227,7 @@ jobs:
       - *setup-python
       - *setup-go
       - *patch-xray
+      - *patch-quic
       - *patch-go
 
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
@@ -289,6 +303,7 @@ jobs:
       - *setup-python
       - *setup-go
       - *patch-xray
+      - *patch-quic
       - *patch-go
 
       - name: Unit tests on macOS

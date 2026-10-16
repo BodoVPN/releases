@@ -1,0 +1,343 @@
+diff --git a/flow_controller_base.go b/flow_controller_base.go
+--- a/flow_controller_base.go
++++ b/flow_controller_base.go
+@@ -19,6 +19,10 @@ type receiveFlowController struct {
+ 	maxReceiveWindowSize protocol.ByteCount
+ 
+ 	allowWindowIncrease func(size protocol.ByteCount) bool
++	// BodoVPN: the read rate, in bytes per second, a window must see to grow
++	// (core/patches/quic-go/README.md); 0 is stock. A loaded link inflates the RTT, which let even a
++	// slow reader's window grow.
++	growMinRate float64
+ 
+ 	epochStartTime   monotime.Time
+ 	epochStartOffset protocol.ByteCount
+@@ -64,7 +68,9 @@ func (c *receiveFlowController) maybeAdjustWindowSize(now monotime.Time) {
+ 	}
+ 
+ 	fraction := float64(bytesReadInEpoch) / float64(c.receiveWindowSize)
+-	if now.Sub(c.epochStartTime) < time.Duration(4*fraction*float64(rtt)) {
++	elapsed := now.Sub(c.epochStartTime)
++	slowReader := c.growMinRate > 0 && float64(bytesReadInEpoch) < c.growMinRate*elapsed.Seconds()
++	if elapsed < time.Duration(4*fraction*float64(rtt)) && !slowReader {
+ 		// window is consumed too fast, try to increase the window size
+ 		newSize := min(2*c.receiveWindowSize, c.maxReceiveWindowSize)
+ 		if newSize > c.receiveWindowSize && (c.allowWindowIncrease == nil || c.allowWindowIncrease(newSize-c.receiveWindowSize)) {
+diff --git a/flow_controller_stream.go b/flow_controller_stream.go
+--- a/flow_controller_stream.go
++++ b/flow_controller_stream.go
+@@ -2,6 +2,9 @@ package quic
+ 
+ import (
+ 	"fmt"
++	"os"
++	"strconv"
++	"sync"
+ 
+ 	"github.com/apernet/quic-go/internal/monotime"
+ 	"github.com/apernet/quic-go/internal/protocol"
+@@ -21,6 +24,9 @@ type streamFlowController struct {
+ 	connection *connectionFlowController
+ 
+ 	receivedFinalOffset bool
++
++	growth *streamGrowthBudget // BodoVPN: nil keeps stock auto-tuning
++	grown  protocol.ByteCount  // BodoVPN: window growth held from growth; guarded by mutex
+ }
+ 
+ // newStreamFlowController gets a new flow controller for a stream.
+@@ -33,7 +39,7 @@ func newStreamFlowController(
+ 	rttStats *utils.RTTStats,
+ 	logger utils.Logger,
+ ) *streamFlowController {
+-	return &streamFlowController{
++	c := &streamFlowController{
+ 		streamID:   streamID,
+ 		connection: cfc,
+ 		sendWindow: initialSendWindow,
+@@ -45,6 +51,31 @@ func newStreamFlowController(
+ 			logger:               logger,
+ 		},
+ 	}
++	if budget := processStreamGrowthBudget(); budget != nil {
++		c.growth = budget
++		c.growMinRate = streamGrowMinRate()
++		c.allowWindowIncrease = func(size protocol.ByteCount) bool { // called with c.mutex held
++			if !budget.take(size) {
++				return false
++			}
++			c.grown += size
++			return true
++		}
++	}
++	return c
++}
++
++// ReleaseGrowth returns the receive window growth the stream held to the process budget, once
++// (BodoVPN). The receive stream calls it when its receive side is done.
++func (c *streamFlowController) ReleaseGrowth() {
++	if c.growth == nil {
++		return
++	}
++	c.mutex.Lock()
++	grown := c.grown
++	c.grown = 0
++	c.mutex.Unlock()
++	c.growth.release(grown)
+ }
+ 
+ // UpdateHighestReceived updates the highestReceived value, if the offset is higher.
+@@ -194,3 +225,61 @@ func (c *streamFlowController) GetWindowUpdate(now monotime.Time) protocol.ByteC
+ 	}
+ 	return offset
+ }
++
++// BodoVPN: a process-wide budget for stream receive windows' auto-tuned growth
++// (core/patches/quic-go/README.md). A window granted to the peer can't be taken back, so a stream
++// that grew while its reader kept up and then stalls can still buffer all of it; growth above each
++// stream's initial window is held from the budget until the stream's receive side is done. A spent
++// budget only stops growth, so no stream starves. BODOCORE_QUIC_STREAM_GROWTH_BUDGET sets it, in
++// bytes; unset, auto-tuning is stock.
++type streamGrowthBudget struct {
++	mu           sync.Mutex
++	budget, used protocol.ByteCount
++}
++
++func (b *streamGrowthBudget) take(n protocol.ByteCount) bool {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	if b.used+n > b.budget {
++		return false
++	}
++	b.used += n
++	return true
++}
++
++func (b *streamGrowthBudget) release(n protocol.ByteCount) {
++	if n == 0 {
++		return
++	}
++	b.mu.Lock()
++	b.used -= n
++	b.mu.Unlock()
++}
++
++var processGrowth struct {
++	sync.Mutex
++	budget *streamGrowthBudget
++}
++
++// processStreamGrowthBudget is the budget every stream in the process shares, nil while unset.
++func processStreamGrowthBudget() *streamGrowthBudget {
++	n, err := strconv.ParseInt(os.Getenv("BODOCORE_QUIC_STREAM_GROWTH_BUDGET"), 10, 64)
++	if err != nil || n <= 0 {
++		return nil
++	}
++	processGrowth.Lock()
++	defer processGrowth.Unlock()
++	if b := processGrowth.budget; b == nil || b.budget != protocol.ByteCount(n) {
++		processGrowth.budget = &streamGrowthBudget{budget: protocol.ByteCount(n)}
++	}
++	return processGrowth.budget
++}
++
++// streamGrowMinRate is BODOCORE_QUIC_GROW_MIN_RATE in bytes per second, 64 KiB/s when unset.
++func streamGrowMinRate() float64 {
++	n, err := strconv.ParseInt(os.Getenv("BODOCORE_QUIC_GROW_MIN_RATE"), 10, 64)
++	if err != nil || n <= 0 {
++		return 64 << 10
++	}
++	return float64(n)
++}
+diff --git a/flow_controller_stream_test.go b/flow_controller_stream_test.go
+--- a/flow_controller_stream_test.go
++++ b/flow_controller_stream_test.go
+@@ -317,3 +317,68 @@ func TestStreamWindowAutoTuning(t *testing.T) {
+ 	// the connection window is also increased, but it bumps into its maximum value
+ 	require.Equal(t, protocol.ByteCount(203+350), connFC.GetWindowUpdate(now))
+ }
++
++// BodoVPN: the process growth budget (core/patches/quic-go/README.md).
++func TestStreamWindowGrowthBudget(t *testing.T) {
++	t.Setenv("BODOCORE_QUIC_STREAM_GROWTH_BUDGET", "100")
++	t.Setenv("BODOCORE_QUIC_GROW_MIN_RATE", "1")
++	rttStats := utils.NewRTTStats()
++	rttStats.UpdateRTT(time.Second, 0)
++	connFC := newConnectionFlowController(1000, 10000, func(protocol.ByteCount) bool { return true }, rttStats, utils.DefaultLogger)
++	newFC := func(id protocol.StreamID) *streamFlowController {
++		return newStreamFlowController(id, connFC, 100, 1000, protocol.MaxByteCount, rttStats, utils.DefaultLogger)
++	}
++	a, b := newFC(1), newFC(5)
++	now := monotime.Now()
++	require.NoError(t, a.UpdateHighestReceived(100, false, now))
++	require.NoError(t, b.UpdateHighestReceived(100, false, now))
++	now = now.Add(100 * time.Millisecond) // half the window read quickly: auto-tuning grows it
++
++	a.AddBytesRead(51)
++	require.Equal(t, protocol.ByteCount(51+200), a.GetWindowUpdate(now), "A's window doubles, taking the whole budget")
++	b.AddBytesRead(51)
++	require.Equal(t, protocol.ByteCount(51+100), b.GetWindowUpdate(now), "B stays at its window: the budget is spent")
++
++	a.ReleaseGrowth()
++	a.ReleaseGrowth() // only once
++	require.NoError(t, b.UpdateHighestReceived(151, false, now))
++	now = now.Add(100 * time.Millisecond)
++	b.AddBytesRead(51)
++	require.Equal(t, protocol.ByteCount(102+200), b.GetWindowUpdate(now), "B grows once A released its growth")
++}
++
++func TestStreamWindowGrowthWithoutABudgetIsStock(t *testing.T) {
++	t.Setenv("BODOCORE_QUIC_STREAM_GROWTH_BUDGET", "")
++	rttStats := utils.NewRTTStats()
++	rttStats.UpdateRTT(time.Second, 0)
++	connFC := newConnectionFlowController(1000, 10000, func(protocol.ByteCount) bool { return true }, rttStats, utils.DefaultLogger)
++	fc := newStreamFlowController(1, connFC, 100, 1000, protocol.MaxByteCount, rttStats, utils.DefaultLogger)
++	require.Nil(t, fc.growth)
++	now := monotime.Now()
++	require.NoError(t, fc.UpdateHighestReceived(100, false, now))
++	now = now.Add(time.Second)
++	fc.AddBytesRead(51)
++	require.Equal(t, protocol.ByteCount(51+200), fc.GetWindowUpdate(now))
++	fc.ReleaseGrowth()
++}
++
++func TestStreamWindowGrowthSkipsASlowReader(t *testing.T) {
++	t.Setenv("BODOCORE_QUIC_STREAM_GROWTH_BUDGET", "1000")
++	t.Setenv("BODOCORE_QUIC_GROW_MIN_RATE", "100") // bytes per second
++	// A loaded link: the RTT reads 10 s, so stock auto-tuning would grow a window read in 2 s.
++	rttStats := utils.NewRTTStats()
++	rttStats.UpdateRTT(10*time.Second, 0)
++	connFC := newConnectionFlowController(1000, 10000, func(protocol.ByteCount) bool { return true }, rttStats, utils.DefaultLogger)
++	fc := newStreamFlowController(1, connFC, 100, 1000, protocol.MaxByteCount, rttStats, utils.DefaultLogger)
++	now := monotime.Now()
++	require.NoError(t, fc.UpdateHighestReceived(100, false, now))
++	now = now.Add(2 * time.Second) // 51 bytes in 2 s: under 100 B/s
++	fc.AddBytesRead(51)
++	require.Equal(t, protocol.ByteCount(51+100), fc.GetWindowUpdate(now), "a slow reader keeps its window")
++
++	fast := newStreamFlowController(5, connFC, 100, 1000, protocol.MaxByteCount, rttStats, utils.DefaultLogger)
++	require.NoError(t, fast.UpdateHighestReceived(100, false, now))
++	now = now.Add(100 * time.Millisecond) // 51 bytes in 0.1 s: over 100 B/s
++	fast.AddBytesRead(51)
++	require.Equal(t, protocol.ByteCount(51+200), fast.GetWindowUpdate(now), "a reader above the rate grows")
++}
+diff --git a/receive_stream.go b/receive_stream.go
+--- a/receive_stream.go
++++ b/receive_stream.go
+@@ -3,6 +3,7 @@ package quic
+ import (
+ 	"fmt"
+ 	"io"
++	"os"
+ 	"sync"
+ 	"time"
+ 
+@@ -50,6 +51,9 @@ type ReceiveStream struct {
+ 	deadline monotime.Time
+ 
+ 	flowController *streamFlowController
++
++	// BodoVPN: copy small payloads out of pooled frames (core/patches/quic-go/README.md).
++	compactFrames bool
+ }
+ 
+ var (
+@@ -67,6 +71,7 @@ func newReceiveStream(
+ 		sender:         sender,
+ 		flowController: flowController,
+ 		frameQueue:     newFrameSorter(),
++		compactFrames:  os.Getenv("BODOCORE_QUIC_COMPACT_STREAM_FRAMES") == "1",
+ 		readChan:       make(chan struct{}, 1),
+ 		readOnce:       make(chan struct{}, 1),
+ 		finalOffset:    protocol.MaxByteCount,
+@@ -123,6 +128,7 @@ func (s *ReceiveStream) Read(p []byte) (int, error) {
+ 	s.mutex.Unlock()
+ 
+ 	if completed {
++		s.flowController.ReleaseGrowth() // BodoVPN: core/patches/quic-go/README.md
+ 		s.sender.onStreamCompleted(s.streamID)
+ 	}
+ 	if queuedStreamWindowUpdate {
+@@ -408,6 +414,7 @@ func (s *ReceiveStream) CancelRead(errorCode StreamErrorCode) {
+ 	}
+ 	if completed {
+ 		s.flowController.Abandon()
++		s.flowController.ReleaseGrowth() // BodoVPN: core/patches/quic-go/README.md
+ 		s.sender.onStreamCompleted(s.streamID)
+ 	}
+ }
+@@ -438,6 +445,7 @@ func (s *ReceiveStream) handleStreamFrame(frame *wire.StreamFrame, now monotime.
+ 
+ 	if completed {
+ 		s.flowController.Abandon()
++		s.flowController.ReleaseGrowth() // BodoVPN: core/patches/quic-go/README.md
+ 		s.sender.onStreamCompleted(s.streamID)
+ 	}
+ 	if callback != nil {
+@@ -460,7 +468,17 @@ func (s *ReceiveStream) handleStreamFrameImpl(frame *wire.StreamFrame, now monot
+ 	if s.cancelledLocally {
+ 		return nil
+ 	}
+-	if err := s.frameQueue.Push(frame.Data, frame.Offset, frame.PutBack); err != nil {
++	data, done := frame.Data, frame.PutBack
++	// BodoVPN: a pooled frame holds a whole packet buffer until its data is read, so a stalled stream
++	// held several times its window in buffers. Copy the payload out of a frame that is mostly empty,
++	// or that queues behind unread data; a stream read as data arrives keeps its frames.
++	if s.compactFrames && cap(data) == protocol.MaxPacketBufferSize &&
++		(len(data) < cap(data)/2 || len(s.frameQueue.queue) > 0) {
++		data = append([]byte(nil), data...)
++		frame.PutBack()
++		done = nil
++	}
++	if err := s.frameQueue.Push(data, frame.Offset, done); err != nil {
+ 		return err
+ 	}
+ 	s.signalRead()
+@@ -475,6 +493,7 @@ func (s *ReceiveStream) handleResetStreamFrame(frame *wire.ResetStreamFrame, now
+ 	s.mutex.Unlock()
+ 
+ 	if completed {
++		s.flowController.ReleaseGrowth() // BodoVPN: core/patches/quic-go/README.md
+ 		s.sender.onStreamCompleted(s.streamID)
+ 	}
+ 	if callback != nil {
+diff --git a/receive_stream_test.go b/receive_stream_test.go
+--- a/receive_stream_test.go
++++ b/receive_stream_test.go
+@@ -1138,3 +1138,36 @@ func TestReceiveStreamResetStreamAtAfterResetStream(t *testing.T) {
+ 	require.ErrorIs(t, err, &StreamError{StreamID: 42, ErrorCode: 1337, Remote: true})
+ 	require.Zero(t, n)
+ }
++
++// BodoVPN: compacting small payloads out of pooled frames (core/patches/quic-go/README.md).
++func TestReceiveStreamCompactsSmallPooledFrames(t *testing.T) {
++	t.Setenv("BODOCORE_QUIC_COMPACT_STREAM_FRAMES", "1")
++	str := newReceiveStream(42, nil, newTestStreamFlowController(42))
++	small := wire.GetStreamFrame()
++	small.Data = append(small.Data[:0], []byte("hello")...)
++	large := wire.GetStreamFrame()
++	large.Offset = 5
++	large.Data = large.Data[:1000]
++	for i := range large.Data {
++		large.Data[i] = 'x'
++	}
++	now := monotime.Now()
++	require.NoError(t, str.handleStreamFrame(small, now))
++	require.NoError(t, str.handleStreamFrame(large, now))
++	// Both went back to the pool (the large one queued behind unread data): overwriting their
++	// buffers must not reach the stream.
++	copy(small.Data[:cap(small.Data)][:5], "XXXXX")
++	copy(large.Data[:cap(large.Data)][:3], "YYY")
++	b := make([]byte, 1005)
++	n, err := io.ReadFull(&readerWithTimeout{Reader: str, Timeout: time.Second}, b)
++	require.NoError(t, err)
++	require.Equal(t, 1005, n)
++	require.Equal(t, "hello", string(b[:5]))
++	require.Equal(t, "xxx", string(b[5:8]))
++}
++
++func TestReceiveStreamKeepsPooledFramesWithoutCompaction(t *testing.T) {
++	t.Setenv("BODOCORE_QUIC_COMPACT_STREAM_FRAMES", "")
++	str := newReceiveStream(42, nil, newTestStreamFlowController(42))
++	require.False(t, str.compactFrames)
++}
