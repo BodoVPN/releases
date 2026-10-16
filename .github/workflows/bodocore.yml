@@ -100,6 +100,11 @@ jobs:
         working-directory: core
         run: go test -race -count=1 ./...
 
+      # The Go patches' own tests, which the overlay swaps in beside the patched files.
+      - name: Go patch tests
+        working-directory: core
+        run: go test -race -count=1 -run 'WindowGrowth|TransportWindow|TransportFlowControl' net/http/internal/http2
+
       - name: Resolve the libXray pin
         id: pin
         env:
