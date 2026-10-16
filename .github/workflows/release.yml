@@ -181,7 +181,7 @@ jobs:
         shell: pwsh
         run: |
           $rel = "build/windows/x64/runner/Release"
-          foreach ($f in "bodovpn_client.exe", "bodovpn_link.exe", "bodovpn_setup_stub.exe", "xray/xray.exe", "xray/tun2socks.exe", "xray/wintun.dll", "xray/geoip.dat", "xray/geosite.dat") {
+          foreach ($f in "bodovpn_client.exe", "bodovpn_link.exe", "bodovpn_setup_stub.exe", "xray/bodocore.exe", "xray/core-manifest.json", "xray/tun2socks.exe", "xray/wintun.dll", "xray/geoip.dat", "xray/geosite.dat") {
             if (-not (Test-Path "$rel/$f")) { Write-Error "missing $f in the Windows bundle"; exit 1 }
           }
 
@@ -339,7 +339,7 @@ jobs:
       - name: Assert the bundle is complete
         run: |
           B=build/linux/x64/release/bundle
-          for f in bodovpn_client lib/xray/xray lib/xray/tun2socks lib/xray/bodovpn-tun-helper lib/xray/geoip.dat lib/xray/geosite.dat; do
+          for f in bodovpn_client lib/xray/bodocore lib/xray/core-manifest.json lib/xray/tun2socks lib/xray/bodovpn-tun-helper lib/xray/geoip.dat lib/xray/geosite.dat; do
             [ -e "$B/$f" ] || { echo "::error::missing $f in the Linux bundle"; exit 1; }
           done
           [ -x "$B/lib/xray/bodovpn-tun-helper" ] || { echo "::error::helper is not executable"; exit 1; }
