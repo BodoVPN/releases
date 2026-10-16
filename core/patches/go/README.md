@@ -52,3 +52,42 @@ SETTINGS apply (Cloudflare advertises 16777215, per golang/go#79831), so the cap
 client.
 
 Drop the patch when the pinned Go caps the buffer itself (golang/go#79831).
+
+## h2-window-growth.patch
+
+The HTTP/2 client advertises a fixed receive window to every response stream: 4 MiB unless a
+`net/http` Transport's `HTTP2` config says otherwise, and XHTTP's client (a bare
+`golang.org/x/net/http2.Transport`, which on Go 1.27 wraps this client) has no such config. When an
+app reads a connection slowly, the tun's send buffer fills, Xray stops reading the response body, and
+the server may still send the whole window, which buffers unread in the client. In an iOS Network
+Extension (about 50 MB before jetsam), two dozen such streams ended the tunnel every 10-15 s. A fixed
+smaller window either stays unsafe (1 MiB) or costs a lone stream a third of its speed (512 KiB);
+capping the connection window instead lets stalled streams starve the live ones sharing it, since
+connection credit comes back only as the app reads.
+
+The patch auto-tunes the stream window instead, as QUIC stacks and browsers do. A stream starts at
+`BODOCORE_H2_STREAM_WINDOW` and doubles, up to `BODOCORE_H2_STREAM_WINDOW_MAX`, each time its reader
+takes a whole window's worth within a second: the window, not the reader, is what limits it. A slow
+or stalled reader never grows. A granted window can't be taken back, so a stream that grew and then
+stalls can still buffer all of it; `BODOCORE_H2_WINDOW_GROWTH_BUDGET` bounds that process-wide, since
+growth above every stream's initial window is held from it until the response body is closed or read
+to the end. Consumed bytes are always credited back, so a spent budget only stops growth and no
+stream starves. All three are read from the environment when a connection is made (a config's root
+`env` sets them); unset, the client is stock, so only a platform that sets them changes. The iOS
+client sets 256 KiB, 4 MiB and 4 MiB.
+
+Measured on an iPhone 15 Pro Max (BodoVPN/bodovpn-client#211), VLESS + XHTTP stream-one + REALITY to
+a throwaway server at about 131 ms round trip:
+
+| client | 24 stalled readers + one 480 KB/s reader, 3 min | one download, 25 s | 8 streams in turn: full speed, then stalled |
+| --- | --- | --- | --- |
+| stock (4 MiB windows) | killed every 10-15 s | 4.15, 3.78 MB/s | not run |
+| fixed 512 KiB | held, 39.4 MiB | 2.49, 2.50, 2.47 MB/s | not run |
+| 2 MiB connection window | held, 36.7 MiB; the live reader starved (20 KB/s) | not run | not run |
+| this patch, no budget | not run | not run | killed: 3 restarts, 45.6 MiB |
+| this patch | held, 36.6 MiB; live reader 496 KB/s | 3.60, 3.79, 3.75 MB/s | held, 36.9 MiB |
+
+`flow_test.go` covers the growth rule, the cap, the budget and its release; `transport_test.go` runs
+the client against frames: growth while the reader keeps up, none for a stalled or slow reader, and a
+budget two streams share.
+
