@@ -32,6 +32,7 @@ fail, run, write_json, sha256 = core.fail, core.run, core.write_json, core.sha25
 
 MODULE = "github.com/bodovpn/releases/core"
 LIBXRAY_MODULE = "github.com/xtls/libxray"
+QUIC_GO_MODULE = "github.com/apernet/quic-go"
 RELEASE_FLAG = f"{MODULE}/engine.release"
 TARGETS = ["android", "apple", "linux-x64", "windows-x64"]
 EXPORTS = ["CGoInvoke", "CGoFree", "BodoPingBatchWarm"]
@@ -116,6 +117,36 @@ def cmd_patch_xray(args):
         run(["git", "apply", str(patch)], cwd=copy)
         print(f"applied {patch.name} to {core.XRAY_CORE_MODULE} {xray['Version']}")
     run(["go", "mod", "edit", f"-replace={core.XRAY_CORE_MODULE}={copy}"], cwd=src)
+
+
+def cmd_patch_quic(args):
+    """Apply core/patches/quic-go/*.patch to the quic-go Xray's Hysteria transport uses, like patch-xray.
+
+    Copies the module cache's (read-only) apernet/quic-go into --work, checks every patch applies
+    cleanly before applying any (a bump that moved the lines fails here, loudly), then
+    `go mod edit -replace`s to the copy. go.mod is left edited for the rest of the job only.
+    """
+    src, work = Path(args.src).resolve(), Path(args.work).resolve()
+    patches = sorted((src / "patches" / "quic-go").glob("*.patch"))
+    if not patches:
+        fail(f"no patches in {src / 'patches' / 'quic-go'}")
+    module = json.loads(run(["go", "list", "-m", "-json", QUIC_GO_MODULE], cwd=src))
+    if module.get("Replace"):
+        fail(f"{QUIC_GO_MODULE} is already replaced by {module['Replace']}")
+    pinned = run(["go", "mod", "download", "-json", f"{QUIC_GO_MODULE}@{module['Version']}"], cwd=src)
+    cache = Path(json.loads(pinned)["Dir"])
+    copy = work / "quic-go"
+    shutil.rmtree(copy, ignore_errors=True)
+    shutil.copytree(cache, copy)
+    for path in [copy, *copy.rglob("*")]:
+        path.chmod(path.stat().st_mode | 0o200)
+    for patch in patches:
+        if subprocess.run(["git", "apply", "--check", "-v", str(patch)], cwd=copy).returncode != 0:
+            fail(f"{patch.name} does not apply to {QUIC_GO_MODULE} {module['Version']}")
+    for patch in patches:
+        run(["git", "apply", str(patch)], cwd=copy)
+        print(f"applied {patch.name} to {QUIC_GO_MODULE} {module['Version']}")
+    run(["go", "mod", "edit", f"-replace={QUIC_GO_MODULE}={copy}"], cwd=src)
 
 
 def cmd_patch_go(args):
@@ -801,6 +832,11 @@ def main():
     p.add_argument("--src", required=True)
     p.add_argument("--work", required=True)
     p.set_defaults(func=cmd_patch_xray)
+
+    p = sub.add_parser("patch-quic")
+    p.add_argument("--src", required=True)
+    p.add_argument("--work", required=True)
+    p.set_defaults(func=cmd_patch_quic)
 
     p = sub.add_parser("patch-go")
     p.add_argument("--src", required=True)
